@@ -43,7 +43,9 @@ function extractImageMetadata(results: Record<string, ScannerResult>): ScanOutpu
     if (name === 'trivy' && result.success) {
       if (data.Metadata) {
         imageDigest = data.Metadata.RepoDigests?.[0];
-        imagePlatform = data.Metadata.OS ? `${data.Metadata.OS}/${data.Metadata.Architecture}` : undefined;
+        const osName = typeof data.Metadata.OS === 'string' ? data.Metadata.OS : data.Metadata.OS?.Family;
+        const arch = typeof data.Metadata.Architecture === 'string' ? data.Metadata.Architecture : undefined;
+        imagePlatform = osName && arch ? `${osName}/${arch}` : undefined;
         imageSizeBytes = data.Metadata.ImageConfig?.size;
       }
     }
