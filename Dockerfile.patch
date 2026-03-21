@@ -1,0 +1,7 @@
+FROM harborguard/core:latest
+
+# Add Buildah + dependencies for patching
+RUN apk add --no-cache buildah podman fuse-overlayfs crun iptables
+
+ENV BUILDAH_ISOLATION=chroot
+ENV STORAGE_DRIVER=overlay
