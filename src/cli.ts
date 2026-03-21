@@ -45,7 +45,7 @@ program
       const scanId = crypto.randomUUID();
       const orchestrator = new ScanOrchestrator(config);
 
-      console.log(`[scan] Scanning ${image} (source: ${opts.source})...`);
+      console.error(`[scan] Scanning ${image} (source: ${opts.source})...`);
 
       const output = await orchestrator.execute({
         id: scanId,
@@ -88,7 +88,7 @@ program
           };
 
           await storage.uploadScanResults(scanId, envelope);
-          console.log(`[scan] Results uploaded to S3: scans/${scanId}/`);
+          console.error(`[scan] Results uploaded to S3: scans/${scanId}/`);
         }
       }
 
@@ -99,7 +99,7 @@ program
         if (key) {
           const client = new AgentClient(url, key);
           await client.uploadResults(envelope);
-          console.log('[scan] Results uploaded to dashboard');
+          console.error('[scan] Results uploaded to dashboard');
         }
       }
 
@@ -110,7 +110,7 @@ program
         const json = JSON.stringify(envelope, null, 2);
         if (opts.outputFile) {
           await writeFile(opts.outputFile, json);
-          console.log(`[scan] Results written to ${opts.outputFile}`);
+          console.error(`[scan] Results written to ${opts.outputFile}`);
         } else {
           console.log(json);
         }
@@ -119,7 +119,7 @@ program
         printTable(envelope);
         if (opts.outputFile) {
           await writeFile(opts.outputFile, JSON.stringify(envelope, null, 2));
-          console.log(`[scan] Full results written to ${opts.outputFile}`);
+          console.error(`[scan] Full results written to ${opts.outputFile}`);
         }
       }
 
