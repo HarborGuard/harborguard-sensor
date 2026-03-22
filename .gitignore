@@ -1,9 +1,6 @@
-# dependencies
-/node_modules
-
-# build
-/dist
-/build
+# binary
+/harborguard-sensor
+*.exe
 
 # env
 .env
@@ -13,12 +10,6 @@
 # misc
 .DS_Store
 *.pem
-
-# debug
-npm-debug.log*
-
-# typescript
-*.tsbuildinfo
 
 # Claude
 /.claude
