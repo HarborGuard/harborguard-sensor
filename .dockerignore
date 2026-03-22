@@ -1,5 +1,5 @@
-node_modules
-dist
+harborguard-sensor
+*.exe
 .git
 .gitignore
 .dockerignore

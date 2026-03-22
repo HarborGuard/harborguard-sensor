@@ -1,11 +1,11 @@
-FROM node:20-alpine AS builder
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci
+FROM golang:1.24-alpine AS builder
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . .
-RUN npm run build
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /harborguard-sensor .
 
-FROM node:20-alpine
+FROM alpine:3.20
 WORKDIR /app
 
 # Scanner binaries
@@ -29,10 +29,8 @@ RUN curl -L "https://github.com/wagoodman/dive/releases/download/v0.13.1/dive_0.
 # OSV Scanner
 RUN curl -L "https://github.com/google/osv-scanner/releases/download/v2.2.2/osv-scanner_linux_amd64" -o /usr/local/bin/osv-scanner && chmod +x /usr/local/bin/osv-scanner
 
-# App
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/package.json ./
+# Binary
+COPY --from=builder /harborguard-sensor /usr/local/bin/harborguard-sensor
 
 # Workspace
 RUN mkdir -p /workspace/cache /workspace/reports
@@ -41,5 +39,5 @@ ENV TRIVY_CACHE_DIR=/workspace/cache/trivy
 ENV GRYPE_DB_CACHE_DIR=/workspace/cache/grype
 ENV SYFT_CACHE_DIR=/workspace/cache/syft
 
-ENTRYPOINT ["node", "dist/index.js"]
+ENTRYPOINT ["harborguard-sensor"]
 CMD ["agent"]
