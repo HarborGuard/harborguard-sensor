@@ -8,8 +8,8 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /harborguard-sensor .
 FROM alpine:3.20
 WORKDIR /app
 
-# Scanner binaries
-RUN apk add --no-cache curl bash ca-certificates
+# Scanner binaries + skopeo for registry image prefetch
+RUN apk add --no-cache curl bash ca-certificates skopeo
 
 # Trivy
 RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.69.3
