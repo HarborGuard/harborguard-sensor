@@ -50,7 +50,7 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 		agentName, _ = os.Hostname()
 	}
 
-	agentID, err := client.Register(types.AgentRegistration{
+	agentID, err := registerWithRetry(client, types.AgentRegistration{
 		Name:            agentName,
 		Version:         sensorVersion,
 		Hostname:        hostname(),
@@ -59,7 +59,7 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 		ScannerVersions: scannerVersions,
 		Capabilities:    []string{"scan"},
 		S3Configured:    cfg.S3Bucket != "",
-	})
+	}, 10)
 	if err != nil {
 		return fmt.Errorf("registering agent: %w", err)
 	}
@@ -223,4 +223,28 @@ func getScannerVersions(scannerNames []string) map[string]string {
 func hostname() string {
 	h, _ := os.Hostname()
 	return h
+}
+
+func registerWithRetry(client *AgentClient, reg types.AgentRegistration, maxRetries int) (string, error) {
+	var lastErr error
+	backoff := time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		agentID, err := client.Register(reg)
+		if err == nil {
+			return agentID, nil
+		}
+		lastErr = err
+		fmt.Fprintf(os.Stderr, "[agent] Registration failed (attempt %d/%d): %s\n", attempt, maxRetries, err.Error())
+
+		if attempt < maxRetries {
+			fmt.Fprintf(os.Stderr, "[agent] Retrying in %s...\n", backoff)
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+	return "", fmt.Errorf("registration failed after %d attempts: %w", maxRetries, lastErr)
 }

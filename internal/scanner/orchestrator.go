@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,13 +45,38 @@ func (o *Orchestrator) Execute(job types.ScanJob) (*types.ScanOutput, error) {
 
 	results := o.runParallel(compatible, job.Source, outputDir)
 
-	// Record skipped scanners
-	for _, s := range incompatible {
-		results[s.Name()] = &types.ScannerResult{
-			Scanner:    s.Name(),
-			Success:    false,
-			Error:      fmt.Sprintf("Source type '%s' not supported", job.Source.Type),
-			DurationMs: 0,
+	// For registry source, prefetch image and run incompatible scanners on tar
+	if job.Source.Type == "registry" && len(incompatible) > 0 {
+		fmt.Fprintf(os.Stderr, "[orchestrator] Prefetching %s for %d incompatible scanner(s)...\n",
+			job.Source.Ref, len(incompatible))
+		tarPath, err := o.prefetchRegistryImage(job.Source, outputDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[orchestrator] Prefetch failed: %s, skipping %d scanner(s)\n",
+				err.Error(), len(incompatible))
+			// Record as skipped
+			for _, s := range incompatible {
+				results[s.Name()] = &types.ScannerResult{
+					Scanner: s.Name(), Success: false,
+					Error: fmt.Sprintf("Prefetch failed: %s", err.Error()), DurationMs: 0,
+				}
+			}
+		} else {
+			// Run incompatible scanners against the tar
+			tarSource := types.ImageSource{Type: "tar", Path: tarPath}
+			tarResults := o.runParallel(incompatible, tarSource, outputDir)
+			for name, result := range tarResults {
+				results[name] = result
+			}
+			// Clean up tar file
+			_ = os.Remove(tarPath)
+		}
+	} else {
+		// Record skipped scanners (original behavior for non-registry)
+		for _, s := range incompatible {
+			results[s.Name()] = &types.ScannerResult{
+				Scanner: s.Name(), Success: false,
+				Error: fmt.Sprintf("Source type '%s' not supported", job.Source.Type), DurationMs: 0,
+			}
 		}
 	}
 
@@ -134,6 +160,18 @@ func (o *Orchestrator) runParallel(scanners []Scanner, source types.ImageSource,
 	}
 
 	return results
+}
+
+func (o *Orchestrator) prefetchRegistryImage(source types.ImageSource, outputDir string) (string, error) {
+	tarPath := filepath.Join(outputDir, "prefetch.tar")
+	ref := source.Ref
+
+	cmd := fmt.Sprintf(`skopeo copy docker://%s docker-archive:%s`, ref, tarPath)
+	_, _, err := ExecWithTimeout(context.Background(), cmd, 300000, nil)
+	if err != nil {
+		return "", fmt.Errorf("prefetch failed: %w", err)
+	}
+	return tarPath, nil
 }
 
 func extractImageMetadata(results map[string]*types.ScannerResult) types.ScanOutputMetadata {
