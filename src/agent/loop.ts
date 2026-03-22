@@ -128,7 +128,7 @@ export async function runAgentLoop(config: SensorConfig): Promise<void> {
       const jobs = await client.pollJobs();
 
       for (const job of jobs) {
-        if (job.type === 'scan' && job.scan) {
+        if ((job.type === 'scan' || job.type === 'SCAN') && job.scan) {
           activeScans++;
           try {
             console.log(`[agent] Starting scan: ${job.scan.imageRef}`);

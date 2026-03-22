@@ -18,7 +18,7 @@ export interface AgentHeartbeat {
 
 export interface AgentJob {
   id: string;
-  type: 'scan' | 'patch';
+  type: 'scan' | 'patch' | 'SCAN' | 'PATCH';
   createdAt: string;
 
   scan?: {
