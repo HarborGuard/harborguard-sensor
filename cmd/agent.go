@@ -1,6 +1,13 @@
 package cmd
 
-import "github.com/spf13/cobra"
+import (
+	"context"
+
+	"github.com/spf13/cobra"
+
+	agentpkg "github.com/HarborGuard/harborguard-sensor/internal/agent"
+	"github.com/HarborGuard/harborguard-sensor/internal/config"
+)
 
 var agentCmd = &cobra.Command{
 	Use:   "agent",
@@ -16,6 +23,20 @@ func init() {
 }
 
 func runAgent(cmd *cobra.Command, args []string) error {
-	// Implemented in later step
-	return nil
+	dashboardURL, _ := cmd.Flags().GetString("dashboard-url")
+	apiKey, _ := cmd.Flags().GetString("api-key")
+	name, _ := cmd.Flags().GetString("name")
+	pollInterval, _ := cmd.Flags().GetString("poll-interval")
+
+	cfg, err := config.LoadConfig(map[string]string{
+		"dashboardUrl": dashboardURL,
+		"apiKey":       apiKey,
+		"agentName":    name,
+		"pollInterval": pollInterval,
+	})
+	if err != nil {
+		return err
+	}
+
+	return agentpkg.RunAgentLoop(context.Background(), cfg)
 }
