@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"fmt"
 	"math"
 	"strings"
 )
