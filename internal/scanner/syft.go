@@ -29,9 +29,14 @@ func (s *SyftScanner) Scan(source types.ImageSource, outputPath string) (*types.
 	}
 	env := BuildEnv(map[string]string{"SYFT_CACHE_DIR": cacheDir})
 
-	// Main JSON output
+	// Main JSON output (retry once on transient failure)
 	cmd := fmt.Sprintf(`syft %s -o json > "%s"`, ref, outputPath)
 	_, _, err := ExecWithTimeout(context.Background(), cmd, syftTimeoutMs, env)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Syft scan failed, retrying: %s\n", err.Error())
+		time.Sleep(2 * time.Second)
+		_, _, err = ExecWithTimeout(context.Background(), cmd, syftTimeoutMs, env)
+	}
 	if err != nil {
 		msg := err.Error()
 		fmt.Fprintf(os.Stderr, "Syft scan failed: %s\n", msg)
