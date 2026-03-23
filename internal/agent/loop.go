@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sync"
 	"strings"
 	"syscall"
 	"time"
@@ -64,6 +65,10 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 		return fmt.Errorf("registering agent: %w", err)
 	}
 	fmt.Fprintf(os.Stderr, "[agent] Registered as %s\n", agentID)
+
+	fmt.Fprintln(os.Stderr, "[agent] Warming up scanner databases...")
+	warmupScannerDBs()
+	fmt.Fprintln(os.Stderr, "[agent] Scanner databases ready")
 
 	// Context with signal handling
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
@@ -223,6 +228,36 @@ func getScannerVersions(scannerNames []string) map[string]string {
 func hostname() string {
 	h, _ := os.Hostname()
 	return h
+}
+
+func warmupScannerDBs() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	var wg sync.WaitGroup
+
+	cmds := []struct {
+		name string
+		cmd  string
+	}{
+		{"trivy", "trivy image --download-db-only"},
+		{"grype", "grype db update"},
+	}
+
+	for _, c := range cmds {
+		wg.Add(1)
+		go func(name, cmd string) {
+			defer wg.Done()
+			_, _, err := scanner.ExecWithTimeout(ctx, cmd, 300000, nil)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[agent] %s DB warmup failed: %s\n", name, err.Error())
+			} else {
+				fmt.Fprintf(os.Stderr, "[agent] %s DB ready\n", name)
+			}
+		}(c.name, c.cmd)
+	}
+
+	wg.Wait()
 }
 
 func registerWithRetry(client *AgentClient, reg types.AgentRegistration, maxRetries int) (string, error) {
