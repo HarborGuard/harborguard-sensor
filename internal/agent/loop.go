@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"strings"
@@ -231,20 +232,46 @@ func hostname() string {
 }
 
 func warmupScannerDBs() {
+	// Check if trivy DB exists
+	trivyCacheDir := os.Getenv("TRIVY_CACHE_DIR")
+	if trivyCacheDir == "" {
+		trivyCacheDir = "/workspace/cache/trivy"
+	}
+	trivyExists := dbDirHasContent(filepath.Join(trivyCacheDir, "db"))
+
+	// Check if grype DB exists
+	grypeCacheDir := os.Getenv("GRYPE_DB_CACHE_DIR")
+	if grypeCacheDir == "" {
+		grypeCacheDir = "/workspace/cache/grype"
+	}
+	grypeExists := dbDirHasContent(grypeCacheDir)
+
+	type dbCmd struct {
+		name string
+		cmd  string
+	}
+
+	var toWarm []dbCmd
+	if trivyExists {
+		fmt.Fprintln(os.Stderr, "[agent] trivy DB already present, skipping download")
+	} else {
+		toWarm = append(toWarm, dbCmd{"trivy", "trivy image --download-db-only"})
+	}
+	if grypeExists {
+		fmt.Fprintln(os.Stderr, "[agent] grype DB already present, skipping download")
+	} else {
+		toWarm = append(toWarm, dbCmd{"grype", "grype db update"})
+	}
+
+	if len(toWarm) == 0 {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	var wg sync.WaitGroup
-
-	cmds := []struct {
-		name string
-		cmd  string
-	}{
-		{"trivy", "trivy image --download-db-only"},
-		{"grype", "grype db update"},
-	}
-
-	for _, c := range cmds {
+	for _, c := range toWarm {
 		wg.Add(1)
 		go func(name, cmd string) {
 			defer wg.Done()
@@ -258,6 +285,11 @@ func warmupScannerDBs() {
 	}
 
 	wg.Wait()
+}
+
+func dbDirHasContent(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	return err == nil && len(entries) > 0
 }
 
 func registerWithRetry(client *AgentClient, reg types.AgentRegistration, maxRetries int) (string, error) {
