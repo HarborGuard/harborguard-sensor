@@ -9,9 +9,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger submodule update in HarborGuard
+        env:
+          GH_TOKEN: ${{ secrets.PARENT_REPO_TOKEN }}
         run: |
-          curl -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.PARENT_REPO_TOKEN }}" \
-            https://api.github.com/repos/HarborGuard/HarborGuard/dispatches \
-            -d '{"event_type":"sensor-updated","client_payload":{"sha":"${{ github.sha }}","ref":"${{ github.ref }}"}}'
+          gh api repos/HarborGuard/HarborGuard/dispatches \
+            -f event_type=sensor-updated \
+            -f "client_payload[sha]=${{ github.sha }}" \
+            -f "client_payload[ref]=${{ github.ref }}"
