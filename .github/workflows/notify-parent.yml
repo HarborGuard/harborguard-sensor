@@ -1,0 +1,17 @@
+name: Notify Parent Repo
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger submodule update in HarborGuard
+        run: |
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.PARENT_REPO_TOKEN }}" \
+            https://api.github.com/repos/HarborGuard/HarborGuard/dispatches \
+            -d '{"event_type":"sensor-updated","client_payload":{"sha":"${{ github.sha }}","ref":"${{ github.ref }}"}}'
