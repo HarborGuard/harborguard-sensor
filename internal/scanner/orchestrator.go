@@ -21,7 +21,7 @@ type Orchestrator struct {
 func (o *Orchestrator) Execute(ctx context.Context, job types.ScanJob) (*types.ScanOutput, error) {
 	startedAt := time.Now().UTC().Format(time.RFC3339)
 	outputDir := filepath.Join(o.Config.WorkDir, "reports", job.ID)
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
+	if err := os.MkdirAll(outputDir, 0700); err != nil {
 		return nil, fmt.Errorf("creating output directory: %w", err)
 	}
 

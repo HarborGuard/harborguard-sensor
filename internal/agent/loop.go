@@ -167,6 +167,14 @@ func processJob(ctx context.Context, client *AgentClient, orch *scanner.Orchestr
 	scan := job.Scan
 	fmt.Fprintf(os.Stderr, "[agent] Starting scan: %s\n", scan.ImageRef)
 
+	// Clean up report directory when job completes
+	reportDir := filepath.Join(orch.Config.WorkDir, "reports", job.ID)
+	defer func() {
+		if err := os.RemoveAll(reportDir); err != nil {
+			fmt.Fprintf(os.Stderr, "[agent] Failed to clean up report dir %s: %s\n", reportDir, err.Error())
+		}
+	}()
+
 	source := resolveImageSource(scan)
 	output, err := orch.Execute(ctx, types.ScanJob{
 		ID:       job.ID,
