@@ -90,17 +90,28 @@ func (c *AgentClient) Heartbeat(status types.AgentHeartbeat) error {
 	return c.request("POST", "/api/agent/heartbeat", status, nil)
 }
 
-// PollJobs polls for available jobs.
-func (c *AgentClient) PollJobs() ([]types.AgentJob, error) {
+// PollJobs polls for available jobs and cancel signals.
+func (c *AgentClient) PollJobs() (*types.PollResponse, error) {
 	if c.agentID == "" {
 		return nil, fmt.Errorf("Agent not registered")
 	}
-	var jobs []types.AgentJob
 	path := fmt.Sprintf("/api/agent/jobs?agentId=%s", c.agentID)
-	if err := c.request("GET", path, nil, &jobs); err != nil {
+
+	// Try structured response first (with cancelJobs field)
+	var response types.PollResponse
+	if err := c.request("GET", path, nil, &response); err != nil {
 		return nil, err
 	}
-	return jobs, nil
+	// If dashboard returns a bare array, Go decodes Jobs as nil and no error.
+	// Fall back to decoding as plain array.
+	if response.Jobs == nil {
+		var jobs []types.AgentJob
+		if err := c.request("GET", path, nil, &jobs); err != nil {
+			return nil, err
+		}
+		response.Jobs = jobs
+	}
+	return &response, nil
 }
 
 // UploadResults uploads scan results to the dashboard.

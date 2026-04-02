@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
@@ -63,6 +65,10 @@ func runScan(cmd *cobra.Command, args []string) error {
 	scanID := uuid.New().String()
 	orch := &scanner.Orchestrator{Config: cfg}
 
+	// Signal context so SIGINT/SIGTERM cancels running scanners
+	ctx, cancel := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
 	fmt.Fprintf(os.Stderr, "[scan] Scanning %s (source: %s)...\n", image, sourceType)
 
 	var scanners []string
@@ -72,7 +78,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	output, err := orch.Execute(types.ScanJob{
+	output, err := orch.Execute(ctx, types.ScanJob{
 		ID:       scanID,
 		ImageRef: image,
 		Source:   source,
@@ -80,6 +86,11 @@ func runScan(cmd *cobra.Command, args []string) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	if output.Cancelled {
+		fmt.Fprintln(os.Stderr, "[scan] Scan cancelled")
+		os.Exit(130)
 	}
 
 	envelope := adapter.BuildEnvelope(

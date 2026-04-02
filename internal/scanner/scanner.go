@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
@@ -9,7 +10,7 @@ import (
 // Scanner is the interface all scanner implementations must satisfy.
 type Scanner interface {
 	Name() string
-	Scan(source types.ImageSource, outputPath string) (*types.ScannerResult, error)
+	Scan(ctx context.Context, source types.ImageSource, outputPath string) (*types.ScannerResult, error)
 	GetVersion() string
 	IsAvailable() bool
 	SupportsSource(source types.ImageSource) bool

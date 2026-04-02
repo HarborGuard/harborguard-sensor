@@ -72,19 +72,23 @@ func BuildEnvelope(job types.ScanJob, output *types.ScanOutput) *types.ScanEnvel
 	}
 
 	// Determine status
-	successCount := 0
-	totalScanners := 0
-	for _, r := range output.Results {
-		totalScanners++
-		if r.Success {
-			successCount++
-		}
-	}
 	status := "PARTIAL"
-	if successCount == 0 {
-		status = "FAILED"
-	} else if successCount == totalScanners {
-		status = "SUCCESS"
+	if output.Cancelled {
+		status = "CANCELLED"
+	} else {
+		successCount := 0
+		totalScanners := 0
+		for _, r := range output.Results {
+			totalScanners++
+			if r.Success {
+				successCount++
+			}
+		}
+		if successCount == 0 {
+			status = "FAILED"
+		} else if successCount == totalScanners {
+			status = "SUCCESS"
+		}
 	}
 
 	name, tag := parseImageRef(job.ImageRef)

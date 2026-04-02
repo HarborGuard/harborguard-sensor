@@ -12,12 +12,13 @@ import (
 )
 
 // ExecWithTimeout runs a shell command with a timeout and returns stdout/stderr.
+// The parent context allows external cancellation (e.g. scan cancel).
 func ExecWithTimeout(ctx context.Context, command string, timeoutMs int64, env []string) (string, string, error) {
 	timeout := time.Duration(timeoutMs) * time.Millisecond
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
+	cmd := exec.CommandContext(timeoutCtx, "/bin/sh", "-c", command)
 	if len(env) > 0 {
 		cmd.Env = env
 	} else {
@@ -29,8 +30,11 @@ func ExecWithTimeout(ctx context.Context, command string, timeoutMs int64, env [
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
-	if ctx.Err() == context.DeadlineExceeded {
+	if timeoutCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
 		return stdout.String(), stderr.String(), fmt.Errorf("command timed out after %dms", timeoutMs)
+	}
+	if ctx.Err() != nil {
+		return stdout.String(), stderr.String(), fmt.Errorf("command cancelled")
 	}
 	return stdout.String(), stderr.String(), err
 }

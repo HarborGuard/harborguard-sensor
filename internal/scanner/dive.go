@@ -15,7 +15,7 @@ type DiveScanner struct{}
 
 func (d *DiveScanner) Name() string { return "dive" }
 
-func (d *DiveScanner) Scan(source types.ImageSource, outputPath string) (*types.ScannerResult, error) {
+func (d *DiveScanner) Scan(ctx context.Context, source types.ImageSource, outputPath string) (*types.ScannerResult, error) {
 	start := time.Now()
 
 	if source.Type == "registry" {
@@ -25,7 +25,7 @@ func (d *DiveScanner) Scan(source types.ImageSource, outputPath string) (*types.
 	}
 
 	cmd := d.buildCommand(source, outputPath)
-	_, _, err := ExecWithTimeout(context.Background(), cmd, diveTimeoutMs, nil)
+	_, _, err := ExecWithTimeout(ctx, cmd, diveTimeoutMs, nil)
 	durationMs := time.Since(start).Milliseconds()
 
 	if err != nil {

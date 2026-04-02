@@ -27,12 +27,13 @@ type ScanJob struct {
 
 // ScanOutput is the raw output from the orchestrator.
 type ScanOutput struct {
-	JobID     string                    `json:"jobId"`
-	ImageRef  string                    `json:"imageRef"`
-	StartedAt string                   `json:"startedAt"`
-	FinishedAt string                  `json:"finishedAt"`
-	Results   map[string]*ScannerResult `json:"results"`
-	Metadata  ScanOutputMetadata        `json:"metadata"`
+	JobID      string                    `json:"jobId"`
+	ImageRef   string                    `json:"imageRef"`
+	StartedAt  string                    `json:"startedAt"`
+	FinishedAt string                    `json:"finishedAt"`
+	Results    map[string]*ScannerResult `json:"results"`
+	Metadata   ScanOutputMetadata        `json:"metadata"`
+	Cancelled  bool                      `json:"cancelled,omitempty"`
 }
 
 // ScanOutputMetadata contains extracted image info.
@@ -225,4 +226,10 @@ type AgentJobPatch struct {
 	Cves           []string `json:"cves"`
 	Strategy       string   `json:"strategy"`
 	TargetRegistry string   `json:"targetRegistry,omitempty"`
+}
+
+// PollResponse wraps the dashboard poll response to include cancel signals.
+type PollResponse struct {
+	Jobs       []AgentJob `json:"jobs"`
+	CancelJobs []string   `json:"cancelJobs,omitempty"`
 }

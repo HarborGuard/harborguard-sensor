@@ -16,7 +16,7 @@ type OsvScanner struct{}
 
 func (o *OsvScanner) Name() string { return "osv" }
 
-func (o *OsvScanner) Scan(source types.ImageSource, outputPath string) (*types.ScannerResult, error) {
+func (o *OsvScanner) Scan(ctx context.Context, source types.ImageSource, outputPath string) (*types.ScannerResult, error) {
 	start := time.Now()
 
 	reportDir := filepath.Dir(outputPath)
@@ -35,9 +35,12 @@ func (o *OsvScanner) Scan(source types.ImageSource, outputPath string) (*types.S
 		// Generate independent SBOM
 		ref := FormatSourceRef(source.Type, source.Ref, source.Path)
 		cmd := fmt.Sprintf(`syft %s -o cyclonedx-json@1.5 > "%s"`, ref, ownSbom)
-		_, _, err := ExecWithTimeout(context.Background(), cmd, osvTimeoutMs, nil)
+		_, _, err := ExecWithTimeout(ctx, cmd, osvTimeoutMs, nil)
 		if err != nil {
 			msg := err.Error()
+			if ctx.Err() != nil {
+				msg = "scan cancelled"
+			}
 			fmt.Fprintf(os.Stderr, "OSV scan failed: %s\n", msg)
 			_ = WriteFallbackResult(outputPath, msg, map[string]interface{}{"vulnerabilities": []interface{}{}})
 			durationMs := time.Since(start).Milliseconds()
@@ -47,7 +50,7 @@ func (o *OsvScanner) Scan(source types.ImageSource, outputPath string) (*types.S
 
 	// Run osv-scanner — exit code 1 means vulns found (success)
 	cmd := fmt.Sprintf(`osv-scanner -L "%s" --verbosity error --format json > "%s"`, ownSbom, outputPath)
-	_, _, err := ExecWithTimeout(context.Background(), cmd, osvTimeoutMs, nil)
+	_, _, err := ExecWithTimeout(ctx, cmd, osvTimeoutMs, nil)
 
 	if err != nil {
 		// Check if output file was written (exit code 1 = vulns found)

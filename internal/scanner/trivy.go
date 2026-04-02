@@ -15,7 +15,7 @@ type TrivyScanner struct{}
 
 func (t *TrivyScanner) Name() string { return "trivy" }
 
-func (t *TrivyScanner) Scan(source types.ImageSource, outputPath string) (*types.ScannerResult, error) {
+func (t *TrivyScanner) Scan(ctx context.Context, source types.ImageSource, outputPath string) (*types.ScannerResult, error) {
 	start := time.Now()
 
 	cmd := t.buildCommand(source, outputPath)
@@ -26,7 +26,7 @@ func (t *TrivyScanner) Scan(source types.ImageSource, outputPath string) (*types
 	}
 	env := BuildEnv(map[string]string{"TRIVY_CACHE_DIR": cacheDir})
 
-	_, _, err := ExecWithTimeout(context.Background(), cmd, trivyTimeoutMs, env)
+	_, _, err := ExecWithTimeout(ctx, cmd, trivyTimeoutMs, env)
 	durationMs := time.Since(start).Milliseconds()
 
 	if err != nil {

@@ -17,7 +17,8 @@ type Orchestrator struct {
 }
 
 // Execute runs all configured scanners for the given job.
-func (o *Orchestrator) Execute(job types.ScanJob) (*types.ScanOutput, error) {
+// The provided context allows cancellation of in-flight scans.
+func (o *Orchestrator) Execute(ctx context.Context, job types.ScanJob) (*types.ScanOutput, error) {
 	startedAt := time.Now().UTC().Format(time.RFC3339)
 	outputDir := filepath.Join(o.Config.WorkDir, "reports", job.ID)
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
@@ -43,14 +44,22 @@ func (o *Orchestrator) Execute(job types.ScanJob) (*types.ScanOutput, error) {
 
 	compatible, incompatible := PartitionBySourceSupport(scanners, job.Source)
 
-	results := o.runParallel(compatible, job.Source, outputDir)
+	results := o.runParallel(ctx, compatible, job.Source, outputDir)
+
+	// Check for cancellation before prefetch
+	if ctx.Err() != nil {
+		return o.buildCancelledOutput(job, startedAt, results, versionMap), nil
+	}
 
 	// For registry source, prefetch image and run incompatible scanners on tar
 	if job.Source.Type == "registry" && len(incompatible) > 0 {
 		fmt.Fprintf(os.Stderr, "[orchestrator] Prefetching %s for %d incompatible scanner(s)...\n",
 			job.Source.Ref, len(incompatible))
-		tarPath, err := o.prefetchRegistryImage(job.Source, outputDir)
+		tarPath, err := o.prefetchRegistryImage(ctx, job.Source, outputDir)
 		if err != nil {
+			if ctx.Err() != nil {
+				return o.buildCancelledOutput(job, startedAt, results, versionMap), nil
+			}
 			fmt.Fprintf(os.Stderr, "[orchestrator] Prefetch failed: %s, skipping %d scanner(s)\n",
 				err.Error(), len(incompatible))
 			// Record as skipped
@@ -63,7 +72,7 @@ func (o *Orchestrator) Execute(job types.ScanJob) (*types.ScanOutput, error) {
 		} else {
 			// Run incompatible scanners against the tar
 			tarSource := types.ImageSource{Type: "tar", Path: tarPath}
-			tarResults := o.runParallel(incompatible, tarSource, outputDir)
+			tarResults := o.runParallel(ctx, incompatible, tarSource, outputDir)
 			for name, result := range tarResults {
 				results[name] = result
 			}
@@ -125,12 +134,24 @@ func (o *Orchestrator) fetchVersions(scanners []Scanner) map[string]string {
 	return versions
 }
 
-func (o *Orchestrator) runParallel(scanners []Scanner, source types.ImageSource, outputDir string) map[string]*types.ScannerResult {
+func (o *Orchestrator) runParallel(ctx context.Context, scanners []Scanner, source types.ImageSource, outputDir string) map[string]*types.ScannerResult {
 	results := make(map[string]*types.ScannerResult)
 	var mu sync.Mutex
 
 	batchSize := o.Config.MaxConcurrentScanners
 	for i := 0; i < len(scanners); i += batchSize {
+		// Skip remaining batches if cancelled
+		if ctx.Err() != nil {
+			for j := i; j < len(scanners); j++ {
+				mu.Lock()
+				results[scanners[j].Name()] = &types.ScannerResult{
+					Scanner: scanners[j].Name(), Success: false, Error: "scan cancelled",
+				}
+				mu.Unlock()
+			}
+			break
+		}
+
 		end := i + batchSize
 		if end > len(scanners) {
 			end = len(scanners)
@@ -143,7 +164,7 @@ func (o *Orchestrator) runParallel(scanners []Scanner, source types.ImageSource,
 			go func(s Scanner) {
 				defer wg.Done()
 				outputPath := filepath.Join(outputDir, s.Name()+".json")
-				result, err := s.Scan(source, outputPath)
+				result, err := s.Scan(ctx, source, outputPath)
 				if err != nil {
 					result = &types.ScannerResult{
 						Scanner: s.Name(),
@@ -162,16 +183,40 @@ func (o *Orchestrator) runParallel(scanners []Scanner, source types.ImageSource,
 	return results
 }
 
-func (o *Orchestrator) prefetchRegistryImage(source types.ImageSource, outputDir string) (string, error) {
+func (o *Orchestrator) prefetchRegistryImage(ctx context.Context, source types.ImageSource, outputDir string) (string, error) {
 	tarPath := filepath.Join(outputDir, "prefetch.tar")
 	ref := source.Ref
 
 	cmd := fmt.Sprintf(`skopeo copy docker://%s docker-archive:%s`, ref, tarPath)
-	_, _, err := ExecWithTimeout(context.Background(), cmd, 300000, nil)
+	_, _, err := ExecWithTimeout(ctx, cmd, 300000, nil)
 	if err != nil {
 		return "", fmt.Errorf("prefetch failed: %w", err)
 	}
 	return tarPath, nil
+}
+
+func (o *Orchestrator) buildCancelledOutput(job types.ScanJob, startedAt string, results map[string]*types.ScannerResult, versionMap map[string]string) *types.ScanOutput {
+	for name, version := range versionMap {
+		if r, ok := results[name]; ok {
+			r.Version = version
+		}
+	}
+	metadata := extractImageMetadata(results)
+	for name, version := range versionMap {
+		if _, exists := metadata.ScannerVersions[name]; !exists {
+			metadata.ScannerVersions[name] = version
+		}
+	}
+	finishedAt := time.Now().UTC().Format(time.RFC3339)
+	return &types.ScanOutput{
+		JobID:      job.ID,
+		ImageRef:   job.ImageRef,
+		StartedAt:  startedAt,
+		FinishedAt: finishedAt,
+		Results:    results,
+		Metadata:   metadata,
+		Cancelled:  true,
+	}
 }
 
 func extractImageMetadata(results map[string]*types.ScannerResult) types.ScanOutputMetadata {

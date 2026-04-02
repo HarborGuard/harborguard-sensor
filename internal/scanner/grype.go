@@ -15,7 +15,7 @@ type GrypeScanner struct{}
 
 func (g *GrypeScanner) Name() string { return "grype" }
 
-func (g *GrypeScanner) Scan(source types.ImageSource, outputPath string) (*types.ScannerResult, error) {
+func (g *GrypeScanner) Scan(ctx context.Context, source types.ImageSource, outputPath string) (*types.ScannerResult, error) {
 	start := time.Now()
 
 	cmd := g.buildCommand(source, outputPath)
@@ -26,7 +26,7 @@ func (g *GrypeScanner) Scan(source types.ImageSource, outputPath string) (*types
 	}
 	env := BuildEnv(map[string]string{"GRYPE_DB_CACHE_DIR": cacheDir})
 
-	_, _, err := ExecWithTimeout(context.Background(), cmd, grypeTimeoutMs, env)
+	_, _, err := ExecWithTimeout(ctx, cmd, grypeTimeoutMs, env)
 	durationMs := time.Since(start).Milliseconds()
 
 	if err != nil {

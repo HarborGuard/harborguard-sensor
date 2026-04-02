@@ -105,6 +105,10 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 		}
 	}()
 
+	// Cancel tracking for in-flight jobs
+	var cancelMu sync.Mutex
+	cancelMap := make(map[string]context.CancelFunc)
+
 	// Poll loop
 	fmt.Fprintln(os.Stderr, "[agent] Polling for jobs...")
 	pollInterval := time.Duration(cfg.PollIntervalMs) * time.Millisecond
@@ -117,16 +121,36 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 		default:
 		}
 
-		jobs, err := client.PollJobs()
+		resp, err := client.PollJobs()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[agent] Poll failed: %s\n", err.Error())
 		} else {
-			for _, job := range jobs {
+			// Process cancel signals
+			for _, cancelJobID := range resp.CancelJobs {
+				cancelMu.Lock()
+				if cancelFn, ok := cancelMap[cancelJobID]; ok {
+					fmt.Fprintf(os.Stderr, "[agent] Cancelling job: %s\n", cancelJobID)
+					cancelFn()
+				}
+				cancelMu.Unlock()
+			}
+
+			for _, job := range resp.Jobs {
 				jobType := strings.ToLower(job.Type)
 				if jobType == "scan" && job.Scan != nil {
+					jobCtx, jobCancel := context.WithCancel(ctx)
+					cancelMu.Lock()
+					cancelMap[job.ID] = jobCancel
+					cancelMu.Unlock()
+
 					activeScans++
-					processJob(client, orch, s3store, job)
+					processJob(jobCtx, client, orch, s3store, job)
 					activeScans--
+
+					cancelMu.Lock()
+					delete(cancelMap, job.ID)
+					cancelMu.Unlock()
+					jobCancel()
 				}
 			}
 		}
@@ -139,12 +163,12 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 	}
 }
 
-func processJob(client *AgentClient, orch *scanner.Orchestrator, s3store *storage.S3Storage, job types.AgentJob) {
+func processJob(ctx context.Context, client *AgentClient, orch *scanner.Orchestrator, s3store *storage.S3Storage, job types.AgentJob) {
 	scan := job.Scan
 	fmt.Fprintf(os.Stderr, "[agent] Starting scan: %s\n", scan.ImageRef)
 
 	source := resolveImageSource(scan)
-	output, err := orch.Execute(types.ScanJob{
+	output, err := orch.Execute(ctx, types.ScanJob{
 		ID:       job.ID,
 		ImageRef: scan.ImageRef,
 		Source:   source,
@@ -154,6 +178,13 @@ func processJob(client *AgentClient, orch *scanner.Orchestrator, s3store *storag
 		msg := err.Error()
 		fmt.Fprintf(os.Stderr, "[agent] Scan failed: %s\n", msg)
 		_ = client.ReportJobStatus(job.ID, "failed", msg)
+		return
+	}
+
+	// If cancelled, report status and skip uploads
+	if output.Cancelled {
+		fmt.Fprintf(os.Stderr, "[agent] Scan cancelled: %s\n", scan.ImageRef)
+		_ = client.ReportJobStatus(job.ID, "cancelled", "")
 		return
 	}
 

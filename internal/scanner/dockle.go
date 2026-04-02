@@ -15,7 +15,7 @@ type DockleScanner struct{}
 
 func (d *DockleScanner) Name() string { return "dockle" }
 
-func (d *DockleScanner) Scan(source types.ImageSource, outputPath string) (*types.ScannerResult, error) {
+func (d *DockleScanner) Scan(ctx context.Context, source types.ImageSource, outputPath string) (*types.ScannerResult, error) {
 	start := time.Now()
 
 	if source.Type == "registry" {
@@ -25,7 +25,7 @@ func (d *DockleScanner) Scan(source types.ImageSource, outputPath string) (*type
 	}
 
 	cmd := d.buildCommand(source, outputPath)
-	_, _, err := ExecWithTimeout(context.Background(), cmd, dockleTimeoutMs, nil)
+	_, _, err := ExecWithTimeout(ctx, cmd, dockleTimeoutMs, nil)
 	durationMs := time.Since(start).Milliseconds()
 
 	if err != nil {

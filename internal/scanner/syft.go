@@ -16,7 +16,7 @@ type SyftScanner struct{}
 
 func (s *SyftScanner) Name() string { return "syft" }
 
-func (s *SyftScanner) Scan(source types.ImageSource, outputPath string) (*types.ScannerResult, error) {
+func (s *SyftScanner) Scan(ctx context.Context, source types.ImageSource, outputPath string) (*types.ScannerResult, error) {
 	start := time.Now()
 
 	ref := FormatSourceRef(source.Type, source.Ref, source.Path)
@@ -31,26 +31,30 @@ func (s *SyftScanner) Scan(source types.ImageSource, outputPath string) (*types.
 
 	// Main JSON output (retry once on transient failure)
 	cmd := fmt.Sprintf(`syft %s -o json > "%s"`, ref, outputPath)
-	_, _, err := ExecWithTimeout(context.Background(), cmd, syftTimeoutMs, env)
-	if err != nil {
+	_, _, err := ExecWithTimeout(ctx, cmd, syftTimeoutMs, env)
+	if err != nil && ctx.Err() == nil {
 		fmt.Fprintf(os.Stderr, "Syft scan failed, retrying: %s\n", err.Error())
 		time.Sleep(2 * time.Second)
-		_, _, err = ExecWithTimeout(context.Background(), cmd, syftTimeoutMs, env)
+		_, _, err = ExecWithTimeout(ctx, cmd, syftTimeoutMs, env)
 	}
 	if err != nil {
 		msg := err.Error()
+		if ctx.Err() != nil {
+			msg = "scan cancelled"
+		}
 		fmt.Fprintf(os.Stderr, "Syft scan failed: %s\n", msg)
 		_ = WriteFallbackResult(outputPath, msg, nil)
 		durationMs := time.Since(start).Milliseconds()
 		return &types.ScannerResult{Scanner: "syft", Success: false, Error: msg, DurationMs: durationMs}, nil
 	}
 
-	// CycloneDX SBOM
-	sbomCmd := fmt.Sprintf(`syft %s -o cyclonedx-json@1.5 > "%s"`, ref, sbomPath)
-	_, _, err = ExecWithTimeout(context.Background(), sbomCmd, syftTimeoutMs, env)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Syft SBOM generation failed: %s\n", err.Error())
-		// Continue - main output succeeded
+	// CycloneDX SBOM (skip if cancelled)
+	if ctx.Err() == nil {
+		sbomCmd := fmt.Sprintf(`syft %s -o cyclonedx-json@1.5 > "%s"`, ref, sbomPath)
+		_, _, err = ExecWithTimeout(ctx, sbomCmd, syftTimeoutMs, env)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Syft SBOM generation failed: %s\n", err.Error())
+		}
 	}
 
 	var data interface{}
