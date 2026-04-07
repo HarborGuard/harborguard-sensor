@@ -2,9 +2,10 @@ package types
 
 // ImageSource represents the source of a container image to scan.
 type ImageSource struct {
-	Type string `json:"type"` // "docker", "registry", "tar"
-	Ref  string `json:"ref,omitempty"`
-	Path string `json:"path,omitempty"`
+	Type  string `json:"type"` // "docker", "registry", "tar", "s3"
+	Ref   string `json:"ref,omitempty"`
+	Path  string `json:"path,omitempty"`
+	S3Key string `json:"s3Key,omitempty"`
 }
 
 // ScannerResult holds the output of a single scanner run.
@@ -210,8 +211,9 @@ type AgentJob struct {
 
 type AgentJobScan struct {
 	ImageRef            string                `json:"imageRef"`
-	Source              string                `json:"source"` // docker, registry, tar
+	Source              string                `json:"source"` // docker, registry, tar, s3
 	TarPath             string                `json:"tarPath,omitempty"`
+	S3Key               string                `json:"s3Key,omitempty"`
 	Scanners            []string              `json:"scanners,omitempty"`
 	RegistryCredentials *RegistryCredentials   `json:"registryCredentials,omitempty"`
 }

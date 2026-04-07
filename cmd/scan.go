@@ -26,7 +26,8 @@ var scanCmd = &cobra.Command{
 }
 
 func init() {
-	scanCmd.Flags().String("source", "docker", "Image source: docker, registry, tar")
+	scanCmd.Flags().String("source", "docker", "Image source: docker, registry, tar, s3")
+	scanCmd.Flags().String("s3-key", "", "S3 object key for image tar (used with --source s3)")
 	scanCmd.Flags().String("scanners", "", "Comma-separated scanner list")
 	scanCmd.Flags().String("output", "table", "Output format: json, table, envelope")
 	scanCmd.Flags().String("output-file", "", "Write results to file")
@@ -44,6 +45,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 	uploadURL, _ := cmd.Flags().GetString("upload-url")
 	apiKey, _ := cmd.Flags().GetString("api-key")
 	s3Bucket, _ := cmd.Flags().GetString("s3-bucket")
+	s3Key, _ := cmd.Flags().GetString("s3-key")
 
 	cfg, err := config.LoadConfig(map[string]string{
 		"scanners": scannersFlag,
@@ -58,12 +60,42 @@ func runScan(cmd *cobra.Command, args []string) error {
 		source = types.ImageSource{Type: "tar", Path: image}
 	case "registry":
 		source = types.ImageSource{Type: "registry", Ref: image}
+	case "s3":
+		key := s3Key
+		if key == "" {
+			key = image
+		}
+		source = types.ImageSource{Type: "s3", Ref: image, S3Key: key}
 	default:
 		source = types.ImageSource{Type: "docker", Ref: image}
 	}
 
 	scanID := uuid.New().String()
 	orch := &scanner.Orchestrator{Config: cfg}
+
+	// Initialize S3 storage if needed (for s3 source or artifact upload)
+	bucket := s3Bucket
+	if bucket == "" {
+		bucket = cfg.S3Bucket
+	}
+	if bucket != "" && cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
+		s3store, s3err := storage.NewS3Storage(types.S3Config{
+			Endpoint:  cfg.S3Endpoint,
+			Bucket:    bucket,
+			AccessKey: cfg.S3AccessKey,
+			SecretKey: cfg.S3SecretKey,
+			Region:    cfg.S3Region,
+		})
+		if s3err != nil {
+			if sourceType == "s3" {
+				return fmt.Errorf("S3 source requires valid S3 configuration: %w", s3err)
+			}
+		} else {
+			orch.S3Storage = s3store
+		}
+	} else if sourceType == "s3" {
+		return fmt.Errorf("S3 source requires S3 configuration (S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY)")
+	}
 
 	// Signal context so SIGINT/SIGTERM cancels running scanners
 	ctx, cancel := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
@@ -99,44 +131,31 @@ func runScan(cmd *cobra.Command, args []string) error {
 	)
 
 	// S3 upload if configured
-	bucket := s3Bucket
-	if bucket == "" {
-		bucket = cfg.S3Bucket
-	}
-	if bucket != "" && cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
-		s3store, s3err := storage.NewS3Storage(types.S3Config{
-			Endpoint:  cfg.S3Endpoint,
-			Bucket:    bucket,
-			AccessKey: cfg.S3AccessKey,
-			SecretKey: cfg.S3SecretKey,
-			Region:    cfg.S3Region,
-		})
-		if s3err == nil {
-			rawResults := make(map[string]string)
-			for scannerName, result := range output.Results {
-				if result.Data != nil {
-					if key, uploadErr := s3store.UploadRawResult(scanID, scannerName, result.Data); uploadErr == nil {
-						rawResults[scannerName] = key
-					}
+	if orch.S3Storage != nil {
+		rawResults := make(map[string]string)
+		for scannerName, result := range output.Results {
+			if result.Data != nil {
+				if key, uploadErr := orch.S3Storage.UploadRawResult(scanID, scannerName, result.Data); uploadErr == nil {
+					rawResults[scannerName] = key
 				}
 			}
-
-			var sbom string
-			if syftResult, ok := output.Results["syft"]; ok && syftResult.Data != nil {
-				if key, uploadErr := s3store.UploadSbom(scanID, syftResult.Data); uploadErr == nil {
-					sbom = key
-				}
-			}
-
-			envelope.Artifacts = &types.EnvelopeArtifacts{
-				S3Prefix:   fmt.Sprintf("scans/%s/", scanID),
-				RawResults: rawResults,
-				Sbom:       sbom,
-			}
-
-			_, _ = s3store.UploadScanResults(scanID, envelope)
-			fmt.Fprintf(os.Stderr, "[scan] Results uploaded to S3: scans/%s/\n", scanID)
 		}
+
+		var sbom string
+		if syftResult, ok := output.Results["syft"]; ok && syftResult.Data != nil {
+			if key, uploadErr := orch.S3Storage.UploadSbom(scanID, syftResult.Data); uploadErr == nil {
+				sbom = key
+			}
+		}
+
+		envelope.Artifacts = &types.EnvelopeArtifacts{
+			S3Prefix:   fmt.Sprintf("scans/%s/", scanID),
+			RawResults: rawResults,
+			Sbom:       sbom,
+		}
+
+		_, _ = orch.S3Storage.UploadScanResults(scanID, envelope)
+		fmt.Fprintf(os.Stderr, "[scan] Results uploaded to S3: scans/%s/\n", scanID)
 	}
 
 	// Dashboard upload

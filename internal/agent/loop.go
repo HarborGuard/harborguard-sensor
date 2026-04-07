@@ -27,8 +27,6 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 	}
 
 	client := NewAgentClient(cfg.DashboardURL, cfg.APIKey)
-	orch := &scanner.Orchestrator{Config: cfg}
-
 	var s3store *storage.S3Storage
 	if cfg.S3Bucket != "" && cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
 		var err error
@@ -43,6 +41,8 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 			return fmt.Errorf("initializing S3: %w", err)
 		}
 	}
+
+	orch := &scanner.Orchestrator{Config: cfg, S3Storage: s3store}
 
 	scannerVersions := getScannerVersions(cfg.EnabledScanners)
 
@@ -248,6 +248,8 @@ func resolveImageSource(scan *types.AgentJobScan) types.ImageSource {
 		return types.ImageSource{Type: "tar", Path: scan.TarPath}
 	case "registry":
 		return types.ImageSource{Type: "registry", Ref: scan.ImageRef}
+	case "s3":
+		return types.ImageSource{Type: "s3", Ref: scan.ImageRef, S3Key: scan.S3Key}
 	default:
 		return types.ImageSource{Type: "docker", Ref: scan.ImageRef}
 	}

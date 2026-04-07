@@ -8,12 +8,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/HarborGuard/harborguard-sensor/internal/storage"
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
 )
 
 // Orchestrator runs multiple scanners against an image.
 type Orchestrator struct {
-	Config *types.SensorConfig
+	Config    *types.SensorConfig
+	S3Storage *storage.S3Storage
 }
 
 // Execute runs all configured scanners for the given job.
@@ -41,6 +43,11 @@ func (o *Orchestrator) Execute(ctx context.Context, job types.ScanJob) (*types.S
 
 	// Get versions concurrently
 	versionMap := o.fetchVersions(scanners)
+
+	// For S3 source, download the tar first and run all scanners against it
+	if job.Source.Type == "s3" {
+		return o.executeS3(ctx, job, scanners, versionMap, startedAt, outputDir)
+	}
 
 	compatible, incompatible := PartitionBySourceSupport(scanners, job.Source)
 
@@ -181,6 +188,62 @@ func (o *Orchestrator) runParallel(ctx context.Context, scanners []Scanner, sour
 	}
 
 	return results
+}
+
+func (o *Orchestrator) executeS3(ctx context.Context, job types.ScanJob, scanners []Scanner, versionMap map[string]string, startedAt string, outputDir string) (*types.ScanOutput, error) {
+	if o.S3Storage == nil {
+		return nil, fmt.Errorf("S3 source requires S3 storage configuration")
+	}
+
+	fmt.Fprintf(os.Stderr, "[orchestrator] Downloading image tar from S3: %s\n", job.Source.S3Key)
+	tarPath, err := o.fetchS3Image(ctx, job.Source, outputDir)
+	if err != nil {
+		if ctx.Err() != nil {
+			results := make(map[string]*types.ScannerResult)
+			return o.buildCancelledOutput(job, startedAt, results, versionMap), nil
+		}
+		return nil, fmt.Errorf("S3 download failed: %w", err)
+	}
+	defer os.Remove(tarPath)
+
+	fmt.Fprintf(os.Stderr, "[orchestrator] Running all scanners against S3 tar: %s\n", job.Source.S3Key)
+	tarSource := types.ImageSource{Type: "tar", Path: tarPath}
+	results := o.runParallel(ctx, scanners, tarSource, outputDir)
+
+	if ctx.Err() != nil {
+		return o.buildCancelledOutput(job, startedAt, results, versionMap), nil
+	}
+
+	for name, version := range versionMap {
+		if r, ok := results[name]; ok {
+			r.Version = version
+		}
+	}
+
+	metadata := extractImageMetadata(results)
+	for name, version := range versionMap {
+		if _, exists := metadata.ScannerVersions[name]; !exists {
+			metadata.ScannerVersions[name] = version
+		}
+	}
+
+	finishedAt := time.Now().UTC().Format(time.RFC3339)
+	return &types.ScanOutput{
+		JobID:      job.ID,
+		ImageRef:   job.ImageRef,
+		StartedAt:  startedAt,
+		FinishedAt: finishedAt,
+		Results:    results,
+		Metadata:   metadata,
+	}, nil
+}
+
+func (o *Orchestrator) fetchS3Image(_ context.Context, source types.ImageSource, outputDir string) (string, error) {
+	tarPath := filepath.Join(outputDir, "s3-image.tar")
+	if err := o.S3Storage.DownloadToFile(source.S3Key, tarPath); err != nil {
+		return "", fmt.Errorf("downloading from S3: %w", err)
+	}
+	return tarPath, nil
 }
 
 func (o *Orchestrator) prefetchRegistryImage(ctx context.Context, source types.ImageSource, outputDir string) (string, error) {
