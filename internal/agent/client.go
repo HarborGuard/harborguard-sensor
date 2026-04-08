@@ -126,6 +126,11 @@ func (c *AgentClient) UploadResults(envelope *types.ScanEnvelope) (string, strin
 	return result.ScanID, result.ImageID, nil
 }
 
+// ReportCatalog sends the discovered registry catalog to the dashboard.
+func (c *AgentClient) ReportCatalog(catalog types.CatalogReport) error {
+	return c.request("POST", "/api/agent/catalog", catalog, nil)
+}
+
 // ReportJobStatus reports the status of a completed job.
 func (c *AgentClient) ReportJobStatus(jobID, status string, errMsg string) error {
 	body := map[string]interface{}{

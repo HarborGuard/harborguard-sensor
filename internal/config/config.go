@@ -132,6 +132,33 @@ func LoadConfig(overrides map[string]string) (*types.SensorConfig, error) {
 	s3SecretKey := envOr([]string{"HG_S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"}, "")
 	s3Region := envOr([]string{"HG_S3_REGION", "AWS_REGION"}, "us-east-1")
 
+	// Registry discovery
+	registryURL := override("registryUrl")
+	if registryURL == "" {
+		registryURL = envOr([]string{"HG_REGISTRY_URL", "REGISTRY_URL"}, "")
+	}
+	registryUsername := envOr([]string{"HG_REGISTRY_USER", "REGISTRY_USER"}, "")
+	registryToken := envOr([]string{"HG_REGISTRY_TOKEN", "REGISTRY_TOKEN"}, "")
+
+	discoveryIntervalRaw := override("discoveryInterval")
+	if discoveryIntervalRaw == "" {
+		discoveryIntervalRaw = envOr([]string{"HG_DISCOVERY_INTERVAL_MS"}, "600000")
+	}
+	discoveryInterval, err := strconv.Atoi(discoveryIntervalRaw)
+	if err != nil {
+		errs = append(errs, "discoveryIntervalMs: must be a number")
+		discoveryInterval = 600000
+	}
+	if registryURL != "" && discoveryInterval < 60000 {
+		errs = append(errs, "discoveryIntervalMs: Number must be greater than or equal to 60000")
+	}
+
+	if registryURL != "" {
+		if _, err := url.ParseRequestURI("https://" + strings.TrimPrefix(strings.TrimPrefix(registryURL, "https://"), "http://")); err != nil {
+			errs = append(errs, "registryUrl: Invalid url")
+		}
+	}
+
 	// Work/cache dirs
 	workDir := envOr([]string{"HG_WORK_DIR", "SCANNER_WORKDIR"}, "/workspace")
 	cacheDir := envOr([]string{"HG_CACHE_DIR"}, "/workspace/cache")
@@ -171,6 +198,10 @@ func LoadConfig(overrides map[string]string) (*types.SensorConfig, error) {
 		WorkDir:               workDir,
 		CacheDir:              cacheDir,
 		LogLevel:              logLevel,
+		RegistryURL:           registryURL,
+		RegistryUsername:      registryUsername,
+		RegistryToken:         registryToken,
+		DiscoveryIntervalMs:   discoveryInterval,
 	}, nil
 }
 

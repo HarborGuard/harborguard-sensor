@@ -8,8 +8,22 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
+
+var (
+	extraEnvMu   sync.RWMutex
+	extraEnvVars map[string]string
+)
+
+// SetExtraEnv sets additional environment variables that will be included
+// in all subsequent BuildEnv calls. Pass nil to clear. Thread-safe.
+func SetExtraEnv(vars map[string]string) {
+	extraEnvMu.Lock()
+	defer extraEnvMu.Unlock()
+	extraEnvVars = vars
+}
 
 // ExecWithTimeout runs a shell command with a timeout and returns stdout/stderr.
 // The parent context allows external cancellation (e.g. scan cancel).
@@ -124,9 +138,15 @@ func FormatSourceRef(sourceType, ref, path string) string {
 	}
 }
 
-// BuildEnv creates an env slice from os.Environ() plus additional key=value pairs.
+// BuildEnv creates an env slice from os.Environ() plus global extra env vars
+// (set via SetExtraEnv) plus per-call additional key=value pairs.
 func BuildEnv(extra map[string]string) []string {
 	env := os.Environ()
+	extraEnvMu.RLock()
+	for k, v := range extraEnvVars {
+		env = append(env, k+"="+v)
+	}
+	extraEnvMu.RUnlock()
 	for k, v := range extra {
 		env = append(env, k+"="+v)
 	}
