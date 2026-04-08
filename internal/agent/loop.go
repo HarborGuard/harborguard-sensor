@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/HarborGuard/harborguard-sensor/internal/adapter"
+	"github.com/HarborGuard/harborguard-sensor/internal/registry"
 	"github.com/HarborGuard/harborguard-sensor/internal/scanner"
 	"github.com/HarborGuard/harborguard-sensor/internal/storage"
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
@@ -44,12 +45,35 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 
 	orch := &scanner.Orchestrator{Config: cfg, S3Storage: s3store}
 
+	// Initialize registry discoverer (if configured)
+	var discoverer *registry.Discoverer
+	if cfg.RegistryURL != "" {
+		var discErr error
+		discoverer, discErr = registry.NewDiscoverer(types.RegistryConfig{
+			URL:                 cfg.RegistryURL,
+			Username:            cfg.RegistryUsername,
+			Token:               cfg.RegistryToken,
+			DiscoveryIntervalMs: cfg.DiscoveryIntervalMs,
+		})
+		if discErr != nil {
+			fmt.Fprintf(os.Stderr, "[agent] Registry discoverer initialization failed: %s\n", discErr.Error())
+		} else {
+			fmt.Fprintf(os.Stderr, "[agent] Registry discovery enabled for %s (%s)\n",
+				cfg.RegistryURL, discoverer.ProviderName())
+		}
+	}
+
 	scannerVersions := getScannerVersions(cfg.EnabledScanners)
 
 	// Register
 	agentName := cfg.AgentName
 	if agentName == "" {
 		agentName, _ = os.Hostname()
+	}
+
+	capabilities := []string{"scan"}
+	if discoverer != nil {
+		capabilities = append(capabilities, "discovery")
 	}
 
 	agentID, err := registerWithRetry(client, types.AgentRegistration{
@@ -59,8 +83,9 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 		OS:              runtime.GOOS,
 		Arch:            runtime.GOARCH,
 		ScannerVersions: scannerVersions,
-		Capabilities:    []string{"scan"},
+		Capabilities:    capabilities,
 		S3Configured:    cfg.S3Bucket != "",
+		RegistryURL:     cfg.RegistryURL,
 	}, 10)
 	if err != nil {
 		return fmt.Errorf("registering agent: %w", err)
@@ -105,6 +130,27 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 		}
 	}()
 
+	// Discovery loop (if registry is configured)
+	if discoverer != nil {
+		discoveryInterval := time.Duration(cfg.DiscoveryIntervalMs) * time.Millisecond
+		go func() {
+			// Run first discovery immediately
+			runDiscovery(ctx, client, discoverer, agentID, cfg.RegistryURL)
+
+			discoveryTicker := time.NewTicker(discoveryInterval)
+			defer discoveryTicker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-discoveryTicker.C:
+					runDiscovery(ctx, client, discoverer, agentID, cfg.RegistryURL)
+				}
+			}
+		}()
+	}
+
 	// Cancel tracking for in-flight jobs
 	var cancelMu sync.Mutex
 	cancelMap := make(map[string]context.CancelFunc)
@@ -144,7 +190,7 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 					cancelMu.Unlock()
 
 					activeScans++
-					processJob(jobCtx, client, orch, s3store, job)
+					processJob(jobCtx, client, orch, s3store, job, discoverer)
 					activeScans--
 
 					cancelMu.Lock()
@@ -163,7 +209,7 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 	}
 }
 
-func processJob(ctx context.Context, client *AgentClient, orch *scanner.Orchestrator, s3store *storage.S3Storage, job types.AgentJob) {
+func processJob(ctx context.Context, client *AgentClient, orch *scanner.Orchestrator, s3store *storage.S3Storage, job types.AgentJob, discoverer *registry.Discoverer) {
 	scan := job.Scan
 	fmt.Fprintf(os.Stderr, "[agent] Starting scan: %s\n", scan.ImageRef)
 
@@ -173,6 +219,13 @@ func processJob(ctx context.Context, client *AgentClient, orch *scanner.Orchestr
 		if err := os.RemoveAll(reportDir); err != nil {
 			fmt.Fprintf(os.Stderr, "[agent] Failed to clean up report dir %s: %s\n", reportDir, err.Error())
 		}
+	}()
+
+	// Resolve registry credentials for scanner passthrough
+	setupRegistryCreds(ctx, orch, scan, discoverer)
+	defer func() {
+		orch.RegistryCreds = nil
+		scanner.SetExtraEnv(nil)
 	}()
 
 	source := resolveImageSource(scan)
@@ -252,6 +305,74 @@ func resolveImageSource(scan *types.AgentJobScan) types.ImageSource {
 		return types.ImageSource{Type: "s3", Ref: scan.ImageRef, S3Key: scan.S3Key}
 	default:
 		return types.ImageSource{Type: "docker", Ref: scan.ImageRef}
+	}
+}
+
+func runDiscovery(ctx context.Context, client *AgentClient, discoverer *registry.Discoverer, agentID, registryURL string) {
+	report := types.CatalogReport{
+		AgentID:      agentID,
+		RegistryURL:  registryURL,
+		Provider:     string(discoverer.ProviderName()),
+		DiscoveredAt: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	repos, err := discoverer.Discover(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return // shutting down
+		}
+		fmt.Fprintf(os.Stderr, "[discovery] Discovery failed: %s\n", err.Error())
+		report.Error = err.Error()
+		report.Repositories = []types.DiscoveredRepository{}
+	} else {
+		report.Repositories = repos
+	}
+
+	if err := client.ReportCatalog(report); err != nil {
+		fmt.Fprintf(os.Stderr, "[discovery] Failed to report catalog: %s\n", err.Error())
+	} else {
+		totalTags := 0
+		for _, r := range report.Repositories {
+			totalTags += len(r.Tags)
+		}
+		fmt.Fprintf(os.Stderr, "[discovery] Catalog reported: %d repositories, %d tags\n",
+			len(report.Repositories), totalTags)
+	}
+}
+
+func setupRegistryCreds(ctx context.Context, orch *scanner.Orchestrator, scan *types.AgentJobScan, discoverer *registry.Discoverer) {
+	var creds map[string]string
+
+	// Job-level credentials take precedence
+	if scan.RegistryCredentials != nil && scan.RegistryCredentials.Username != "" {
+		creds = map[string]string{
+			"TRIVY_USERNAME":                 scan.RegistryCredentials.Username,
+			"TRIVY_PASSWORD":                 scan.RegistryCredentials.Password,
+			"GRYPE_REGISTRY_AUTH_USERNAME":   scan.RegistryCredentials.Username,
+			"GRYPE_REGISTRY_AUTH_PASSWORD":   scan.RegistryCredentials.Password,
+			"SYFT_REGISTRY_AUTH_USERNAME":    scan.RegistryCredentials.Username,
+			"SYFT_REGISTRY_AUTH_PASSWORD":    scan.RegistryCredentials.Password,
+		}
+	} else if discoverer != nil && scan.Source == "registry" {
+		// Use sensor-level credentials from the discoverer
+		resolved, err := discoverer.GetCredentials(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[agent] Failed to resolve registry creds for passthrough: %s\n", err.Error())
+		} else if resolved != nil {
+			creds = map[string]string{
+				"TRIVY_USERNAME":                 resolved.Username,
+				"TRIVY_PASSWORD":                 resolved.Password,
+				"GRYPE_REGISTRY_AUTH_USERNAME":   resolved.Username,
+				"GRYPE_REGISTRY_AUTH_PASSWORD":   resolved.Password,
+				"SYFT_REGISTRY_AUTH_USERNAME":    resolved.Username,
+				"SYFT_REGISTRY_AUTH_PASSWORD":    resolved.Password,
+			}
+		}
+	}
+
+	if creds != nil {
+		orch.RegistryCreds = creds
+		scanner.SetExtraEnv(creds)
 	}
 }
 

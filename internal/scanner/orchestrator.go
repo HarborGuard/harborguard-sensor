@@ -14,8 +14,9 @@ import (
 
 // Orchestrator runs multiple scanners against an image.
 type Orchestrator struct {
-	Config    *types.SensorConfig
-	S3Storage *storage.S3Storage
+	Config        *types.SensorConfig
+	S3Storage     *storage.S3Storage
+	RegistryCreds map[string]string // Extra env vars for registry auth (TRIVY_USERNAME, etc.)
 }
 
 // Execute runs all configured scanners for the given job.
@@ -250,8 +251,18 @@ func (o *Orchestrator) prefetchRegistryImage(ctx context.Context, source types.I
 	tarPath := filepath.Join(outputDir, "prefetch.tar")
 	ref := source.Ref
 
-	cmd := fmt.Sprintf(`skopeo copy docker://%s docker-archive:%s`, ref, tarPath)
-	_, _, err := ExecWithTimeout(ctx, cmd, 300000, nil)
+	var cmd string
+	var env []string
+
+	if user := o.RegistryCreds["TRIVY_USERNAME"]; user != "" {
+		pass := o.RegistryCreds["TRIVY_PASSWORD"]
+		cmd = fmt.Sprintf(`skopeo copy --src-creds "${SKOPEO_CREDS}" docker://%s docker-archive:%s`, ref, tarPath)
+		env = BuildEnv(map[string]string{"SKOPEO_CREDS": user + ":" + pass})
+	} else {
+		cmd = fmt.Sprintf(`skopeo copy docker://%s docker-archive:%s`, ref, tarPath)
+	}
+
+	_, _, err := ExecWithTimeout(ctx, cmd, 300000, env)
 	if err != nil {
 		return "", fmt.Errorf("prefetch failed: %w", err)
 	}

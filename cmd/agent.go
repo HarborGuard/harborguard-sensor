@@ -20,6 +20,8 @@ func init() {
 	agentCmd.Flags().String("api-key", "", "API key (env: HG_API_KEY)")
 	agentCmd.Flags().String("name", "", "Agent name (env: HG_AGENT_NAME)")
 	agentCmd.Flags().String("poll-interval", "10000", "Poll interval in ms")
+	agentCmd.Flags().String("registry-url", "", "Registry URL for discovery (env: HG_REGISTRY_URL)")
+	agentCmd.Flags().String("discovery-interval", "600000", "Discovery interval in ms (env: HG_DISCOVERY_INTERVAL_MS)")
 }
 
 func runAgent(cmd *cobra.Command, args []string) error {
@@ -27,12 +29,16 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	apiKey, _ := cmd.Flags().GetString("api-key")
 	name, _ := cmd.Flags().GetString("name")
 	pollInterval, _ := cmd.Flags().GetString("poll-interval")
+	registryURL, _ := cmd.Flags().GetString("registry-url")
+	discoveryInterval, _ := cmd.Flags().GetString("discovery-interval")
 
 	cfg, err := config.LoadConfig(map[string]string{
-		"dashboardUrl": dashboardURL,
-		"apiKey":       apiKey,
-		"agentName":    name,
-		"pollInterval": pollInterval,
+		"dashboardUrl":      dashboardURL,
+		"apiKey":            apiKey,
+		"agentName":         name,
+		"pollInterval":      pollInterval,
+		"registryUrl":       registryURL,
+		"discoveryInterval": discoveryInterval,
 	})
 	if err != nil {
 		return err

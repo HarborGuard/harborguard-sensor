@@ -1,5 +1,51 @@
 package types
 
+import "time"
+
+// RegistryProvider identifies the type of container registry.
+type RegistryProvider string
+
+const (
+	ProviderECR       RegistryProvider = "ecr"
+	ProviderGAR       RegistryProvider = "gar"
+	ProviderACR       RegistryProvider = "acr"
+	ProviderDockerHub RegistryProvider = "dockerhub"
+	ProviderGHCR      RegistryProvider = "ghcr"
+	ProviderGitLab    RegistryProvider = "gitlab"
+	ProviderGeneric   RegistryProvider = "generic"
+)
+
+// RegistryConfig holds configuration for registry discovery.
+type RegistryConfig struct {
+	URL                 string
+	Username            string
+	Token               string
+	DiscoveryIntervalMs int
+}
+
+// ResolvedCredentials holds registry credentials with optional expiry for token refresh.
+type ResolvedCredentials struct {
+	Username  string
+	Password  string
+	ExpiresAt *time.Time
+}
+
+// DiscoveredRepository represents a single repository found in a registry.
+type DiscoveredRepository struct {
+	Name string   `json:"name"`
+	Tags []string `json:"tags"`
+}
+
+// CatalogReport is the payload sent to POST /api/agent/catalog.
+type CatalogReport struct {
+	AgentID      string                 `json:"agentId"`
+	RegistryURL  string                 `json:"registryUrl"`
+	Provider     string                 `json:"provider"`
+	Repositories []DiscoveredRepository `json:"repositories"`
+	DiscoveredAt string                 `json:"discoveredAt"`
+	Error        string                 `json:"error,omitempty"`
+}
+
 // ImageSource represents the source of a container image to scan.
 type ImageSource struct {
 	Type  string `json:"type"` // "docker", "registry", "tar", "s3"
@@ -154,21 +200,25 @@ type NormalizedEfficiency struct {
 
 // SensorConfig holds all runtime configuration.
 type SensorConfig struct {
-	EnabledScanners      []string
-	ScanTimeoutMinutes   int
+	EnabledScanners       []string
+	ScanTimeoutMinutes    int
 	MaxConcurrentScanners int
-	DashboardURL         string
-	APIKey               string
-	AgentName            string
-	PollIntervalMs       int
-	S3Endpoint           string
-	S3Bucket             string
-	S3AccessKey          string
-	S3SecretKey          string
-	S3Region             string
-	WorkDir              string
-	CacheDir             string
-	LogLevel             string
+	DashboardURL          string
+	APIKey                string
+	AgentName             string
+	PollIntervalMs        int
+	S3Endpoint            string
+	S3Bucket              string
+	S3AccessKey           string
+	S3SecretKey           string
+	S3Region              string
+	WorkDir               string
+	CacheDir              string
+	LogLevel              string
+	RegistryURL           string
+	RegistryUsername      string
+	RegistryToken         string
+	DiscoveryIntervalMs   int
 }
 
 // S3Config holds S3 storage configuration.
@@ -190,6 +240,7 @@ type AgentRegistration struct {
 	ScannerVersions map[string]string `json:"scannerVersions"`
 	Capabilities    []string          `json:"capabilities"`
 	S3Configured    bool              `json:"s3Configured"`
+	RegistryURL     string            `json:"registryUrl,omitempty"`
 }
 
 // AgentHeartbeat is sent periodically to the dashboard.
