@@ -132,6 +132,12 @@ func LoadConfig(overrides map[string]string) (*types.SensorConfig, error) {
 	s3SecretKey := envOr([]string{"HG_S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"}, "")
 	s3Region := envOr([]string{"HG_S3_REGION", "AWS_REGION"}, "us-east-1")
 
+	// Sensor ID (persists identity across restarts)
+	sensorID := override("sensorId")
+	if sensorID == "" {
+		sensorID = envOr([]string{"HG_SENSOR_ID"}, "")
+	}
+
 	// Registry discovery
 	registryURL := override("registryUrl")
 	if registryURL == "" {
@@ -189,6 +195,7 @@ func LoadConfig(overrides map[string]string) (*types.SensorConfig, error) {
 		DashboardURL:          dashboardURL,
 		APIKey:                apiKey,
 		AgentName:             agentName,
+		SensorID:              sensorID,
 		PollIntervalMs:        pollInterval,
 		S3Endpoint:            s3Endpoint,
 		S3Bucket:              s3Bucket,

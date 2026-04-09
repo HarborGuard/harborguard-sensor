@@ -86,6 +86,7 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 		Capabilities:    capabilities,
 		S3Configured:    cfg.S3Bucket != "",
 		RegistryURL:     cfg.RegistryURL,
+		SensorID:        cfg.SensorID,
 	}, 10)
 	if err != nil {
 		return fmt.Errorf("registering agent: %w", err)

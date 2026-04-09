@@ -206,6 +206,7 @@ type SensorConfig struct {
 	DashboardURL          string
 	APIKey                string
 	AgentName             string
+	SensorID              string
 	PollIntervalMs        int
 	S3Endpoint            string
 	S3Bucket              string
@@ -241,6 +242,7 @@ type AgentRegistration struct {
 	Capabilities    []string          `json:"capabilities"`
 	S3Configured    bool              `json:"s3Configured"`
 	RegistryURL     string            `json:"registryUrl,omitempty"`
+	SensorID        string            `json:"sensorId,omitempty"`
 }
 
 // AgentHeartbeat is sent periodically to the dashboard.
