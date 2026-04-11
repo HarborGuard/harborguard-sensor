@@ -93,13 +93,14 @@ type ScanOutputMetadata struct {
 
 // ScanEnvelope is the top-level JSON output contract.
 type ScanEnvelope struct {
-	Version string         `json:"version"`
-	Sensor  EnvelopeSensor `json:"sensor"`
-	Image   EnvelopeImage  `json:"image"`
-	Scan    EnvelopeScan   `json:"scan"`
-	Findings EnvelopeFindings `json:"findings"`
-	Aggregates EnvelopeAggregates `json:"aggregates"`
-	Artifacts *EnvelopeArtifacts `json:"artifacts,omitempty"`
+	Version    string              `json:"version"`
+	Sensor     EnvelopeSensor      `json:"sensor"`
+	Image      EnvelopeImage       `json:"image"`
+	Scan       EnvelopeScan        `json:"scan"`
+	Findings   EnvelopeFindings    `json:"findings"`
+	Aggregates EnvelopeAggregates  `json:"aggregates"`
+	Layers     []EnvelopeLayer     `json:"layers,omitempty"`
+	Artifacts  *EnvelopeArtifacts  `json:"artifacts,omitempty"`
 }
 
 type EnvelopeSensor struct {
@@ -186,6 +187,23 @@ type NormalizedCompliance struct {
 	Source   string `json:"source"`
 	Category string `json:"category,omitempty"`
 	Message  string `json:"message,omitempty"`
+}
+
+// EnvelopeLayer describes a single image layer extracted from Dive analysis.
+type EnvelopeLayer struct {
+	Index     int         `json:"index"`
+	Digest    string      `json:"digest,omitempty"`
+	Command   string      `json:"command"`
+	SizeBytes int64       `json:"sizeBytes"`
+	FileCount int         `json:"fileCount"`
+	TopFiles  []LayerFile `json:"topFiles,omitempty"`
+}
+
+// LayerFile describes a notable file within a layer.
+type LayerFile struct {
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	Status string `json:"status"` // "added", "modified", "removed"
 }
 
 // NormalizedEfficiency is a scanner-agnostic efficiency finding.

@@ -14,6 +14,7 @@ func BuildEnvelope(job types.ScanJob, output *types.ScanOutput) *types.ScanEnvel
 	var packages []types.NormalizedPackage
 	var compliance []types.NormalizedCompliance
 	var efficiency []types.NormalizedEfficiency
+	var layers []types.EnvelopeLayer
 
 	for scanner, result := range output.Results {
 		if !result.Success || result.Data == nil {
@@ -33,6 +34,7 @@ func BuildEnvelope(job types.ScanJob, output *types.ScanOutput) *types.ScanEnvel
 			compliance = append(compliance, ExtractDockleCompliance(data)...)
 		case "dive":
 			efficiency = append(efficiency, ExtractDiveEfficiency(data)...)
+			layers = append(layers, ExtractDiveLayers(data)...)
 		case "osv":
 			vulnerabilities = append(vulnerabilities, ExtractOsvVulnerabilities(data)...)
 		}
@@ -106,6 +108,9 @@ func BuildEnvelope(job types.ScanJob, output *types.ScanOutput) *types.ScanEnvel
 	if efficiency == nil {
 		efficiency = []types.NormalizedEfficiency{}
 	}
+	if layers == nil {
+		layers = []types.EnvelopeLayer{}
+	}
 
 	return &types.ScanEnvelope{
 		Version: "1.0",
@@ -146,6 +151,7 @@ func BuildEnvelope(job types.ScanJob, output *types.ScanOutput) *types.ScanEnvel
 			ComplianceGrade: complianceGrade,
 			TotalPackages:   len(packages),
 		},
+		Layers: layers,
 	}
 }
 
