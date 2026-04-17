@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/HarborGuard/harborguard-sensor/internal/adapter"
+	"github.com/HarborGuard/harborguard-sensor/internal/patcher"
 	"github.com/HarborGuard/harborguard-sensor/internal/registry"
 	"github.com/HarborGuard/harborguard-sensor/internal/scanner"
 	"github.com/HarborGuard/harborguard-sensor/internal/storage"
@@ -71,9 +72,34 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 		agentName, _ = os.Hostname()
 	}
 
-	capabilities := []string{"scan"}
+	capabilities := []string{types.CapScan}
 	if discoverer != nil {
-		capabilities = append(capabilities, "discovery")
+		capabilities = append(capabilities, types.CapDiscovery)
+	}
+
+	// Patch capability probe. Starts buildkitd as a child process if the
+	// environment supports it; otherwise the sensor registers without
+	// "patch" and the dashboard will never dispatch patch jobs to it.
+	var patcherInstance *patcher.Patcher
+	if canPatch, reason := patcher.Probe(); canPatch {
+		fmt.Fprintf(os.Stderr, "[agent] %s\n", reason)
+		bk, bkErr := patcher.StartBuildKit(ctx, patcher.DefaultStorageRoot(cfg.WorkDir), os.Stderr)
+		if bkErr != nil {
+			fmt.Fprintf(os.Stderr, "[agent] buildkitd failed to start: %s; registering without patch capability\n", bkErr.Error())
+		} else {
+			capabilities = append(capabilities, types.CapPatch)
+			sensorCreds := resolveSensorRegistryCreds(ctx, discoverer)
+			patcherInstance = &patcher.Patcher{
+				Config:              cfg,
+				BuildKit:            bk,
+				S3Storage:           s3store,
+				SensorRegistryCreds: sensorCreds,
+			}
+			defer func() { _ = bk.Stop() }()
+			fmt.Fprintln(os.Stderr, "[agent] buildkitd is running; patch capability enabled")
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "[agent] patch capability disabled: %s\n", reason)
 	}
 
 	agentID, err := registerWithRetry(client, types.AgentRegistration{
@@ -103,7 +129,7 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 
 	// Heartbeat ticker
 	startTime := time.Now()
-	activeScans := 0
+	activeJobs := 0
 
 	heartbeatTicker := time.NewTicker(30 * time.Second)
 	defer heartbeatTicker.Stop()
@@ -115,13 +141,13 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 				return
 			case <-heartbeatTicker.C:
 				status := "idle"
-				if activeScans > 0 {
+				if activeJobs > 0 {
 					status = "scanning"
 				}
 				hb := types.AgentHeartbeat{
 					AgentID:       agentID,
 					Status:        status,
-					ActiveScans:   activeScans,
+					ActiveScans:   activeJobs,
 					UptimeSeconds: int64(time.Since(startTime).Seconds()),
 				}
 				if err := client.Heartbeat(hb); err != nil {
@@ -184,15 +210,37 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 
 			for _, job := range resp.Jobs {
 				jobType := strings.ToLower(job.Type)
-				if jobType == "scan" && job.Scan != nil {
+				switch {
+				case jobType == "scan" && job.Scan != nil:
 					jobCtx, jobCancel := context.WithCancel(ctx)
 					cancelMu.Lock()
 					cancelMap[job.ID] = jobCancel
 					cancelMu.Unlock()
 
-					activeScans++
+					activeJobs++
 					processJob(jobCtx, client, orch, s3store, job, discoverer)
-					activeScans--
+					activeJobs--
+
+					cancelMu.Lock()
+					delete(cancelMap, job.ID)
+					cancelMu.Unlock()
+					jobCancel()
+
+				case jobType == "patch" && job.Patch != nil:
+					if patcherInstance == nil {
+						msg := "patch job received but sensor has no patch capability"
+						fmt.Fprintf(os.Stderr, "[agent] %s (job=%s)\n", msg, job.ID)
+						_ = client.ReportJobStatus(job.ID, "failed", msg)
+						continue
+					}
+					jobCtx, jobCancel := context.WithCancel(ctx)
+					cancelMu.Lock()
+					cancelMap[job.ID] = jobCancel
+					cancelMu.Unlock()
+
+					activeJobs++
+					processPatchJob(jobCtx, client, patcherInstance, job)
+					activeJobs--
 
 					cancelMu.Lock()
 					delete(cancelMap, job.ID)
@@ -294,6 +342,50 @@ func processJob(ctx context.Context, client *AgentClient, orch *scanner.Orchestr
 		fmt.Fprintf(os.Stderr, "[agent] Status report failed: %s\n", err.Error())
 	}
 	fmt.Fprintf(os.Stderr, "[agent] Scan complete: %s\n", scan.ImageRef)
+}
+
+func processPatchJob(ctx context.Context, client *AgentClient, p *patcher.Patcher, job types.AgentJob) {
+	patch := job.Patch
+	fmt.Fprintf(os.Stderr, "[agent] Starting patch: %s -> sink=%s\n", patch.Source.Ref, patch.Sink.Kind)
+
+	envelope, err := p.Execute(ctx, types.PatchJob{
+		ID:  job.ID,
+		Job: *patch,
+	})
+	if err != nil {
+		msg := err.Error()
+		fmt.Fprintf(os.Stderr, "[agent] Patch failed: %s\n", msg)
+		_ = client.ReportJobStatus(job.ID, "failed", msg)
+		return
+	}
+
+	if _, err := client.UploadPatchResult(envelope); err != nil {
+		fmt.Fprintf(os.Stderr, "[agent] Patch upload failed: %s\n", err.Error())
+		_ = client.ReportJobStatus(job.ID, "failed", err.Error())
+		return
+	}
+
+	if err := client.ReportJobStatus(job.ID, "completed", ""); err != nil {
+		fmt.Fprintf(os.Stderr, "[agent] Patch status report failed: %s\n", err.Error())
+	}
+	fmt.Fprintf(os.Stderr, "[agent] Patch complete: %s -> %s\n", patch.Source.Ref, envelope.Sink.Location)
+}
+
+// resolveSensorRegistryCreds pulls out the sensor-level registry credentials
+// (e.g. from the registry discoverer) for use as a fallback when a patch job
+// doesn't supply its own. Returns nil if unavailable.
+func resolveSensorRegistryCreds(ctx context.Context, discoverer *registry.Discoverer) *types.RegistryCredentials {
+	if discoverer == nil {
+		return nil
+	}
+	resolved, err := discoverer.GetCredentials(ctx)
+	if err != nil || resolved == nil {
+		return nil
+	}
+	return &types.RegistryCredentials{
+		Username: resolved.Username,
+		Password: resolved.Password,
+	}
 }
 
 func resolveImageSource(scan *types.AgentJobScan) types.ImageSource {

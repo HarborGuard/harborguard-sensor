@@ -126,6 +126,17 @@ func (c *AgentClient) UploadResults(envelope *types.ScanEnvelope) (string, strin
 	return result.ScanID, result.ImageID, nil
 }
 
+// UploadPatchResult uploads the patch envelope to the dashboard.
+func (c *AgentClient) UploadPatchResult(envelope *types.PatchEnvelope) (string, error) {
+	var result struct {
+		PatchID string `json:"patchId"`
+	}
+	if err := c.request("POST", "/api/patches/upload", envelope, &result); err != nil {
+		return "", err
+	}
+	return result.PatchID, nil
+}
+
 // ReportCatalog sends the discovered registry catalog to the dashboard.
 func (c *AgentClient) ReportCatalog(catalog types.CatalogReport) error {
 	return c.request("POST", "/api/agent/catalog", catalog, nil)

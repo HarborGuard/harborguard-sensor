@@ -294,12 +294,107 @@ type RegistryCredentials struct {
 	Password string `json:"password"`
 }
 
+// AgentJobPatch describes a patch job dispatched from the dashboard.
+// The sensor takes an explicit list of packages to upgrade; CVE → package
+// resolution happens dashboard-side.
 type AgentJobPatch struct {
-	ImageRef       string   `json:"imageRef"`
-	Cves           []string `json:"cves"`
-	Strategy       string   `json:"strategy"`
-	TargetRegistry string   `json:"targetRegistry,omitempty"`
+	Source              ImageSource          `json:"source"`
+	SourceCredentials   *RegistryCredentials `json:"sourceCredentials,omitempty"`
+	Packages            []PatchPackage       `json:"packages"`
+	StrategyHint        string               `json:"strategyHint,omitempty"` // auto | apt | apk | yum | dnf
+	Sink                PatchSink            `json:"sink"`
+	PreserveConfig      bool                 `json:"preserveConfig,omitempty"`
 }
+
+// PatchPackage is a single package to upgrade.
+// PackageManager is optional; when blank and StrategyHint=="auto", the sensor
+// detects it from the source image.
+type PatchPackage struct {
+	Name           string `json:"name"`
+	TargetVersion  string `json:"targetVersion"`
+	PackageManager string `json:"packageManager,omitempty"` // apt | apk | yum | dnf
+}
+
+// PatchSink is a tagged union describing where the patched image is shipped.
+type PatchSink struct {
+	Kind      string               `json:"kind"` // "registry" | "s3" | "presigned"
+	Registry  *PatchSinkRegistry   `json:"registry,omitempty"`
+	S3        *PatchSinkS3         `json:"s3,omitempty"`
+	Presigned *PatchSinkPresigned  `json:"presigned,omitempty"`
+}
+
+// PatchSinkRegistry pushes the patched image to a container registry.
+type PatchSinkRegistry struct {
+	Ref         string               `json:"ref"`                   // e.g. registry.example.com/app
+	Tag         string               `json:"tag"`                   // required; sensor never picks a tag
+	Credentials *RegistryCredentials `json:"credentials,omitempty"` // optional; falls back to sensor creds
+}
+
+// PatchSinkS3 uploads the patched image tarball to S3 under keyPrefix.
+type PatchSinkS3 struct {
+	Bucket    string `json:"bucket,omitempty"`    // overrides sensor default
+	KeyPrefix string `json:"keyPrefix,omitempty"` // e.g. patches/<id>/
+}
+
+// PatchSinkPresigned uploads to S3 and returns a presigned GET URL.
+type PatchSinkPresigned struct {
+	Bucket    string `json:"bucket,omitempty"`
+	KeyPrefix string `json:"keyPrefix,omitempty"`
+	TTLSecs   int    `json:"ttlSecs,omitempty"` // default 3600 if unset
+}
+
+// PatchJob is the internal sensor-side representation (parallels ScanJob).
+type PatchJob struct {
+	ID  string          `json:"id"`
+	Job AgentJobPatch   `json:"job"`
+}
+
+// PatchEnvelope is the top-level JSON uploaded to the dashboard after a patch.
+type PatchEnvelope struct {
+	Version    string                    `json:"version"`
+	Sensor     EnvelopeSensor            `json:"sensor"`
+	Source     EnvelopeImage             `json:"source"`
+	Patched    EnvelopePatchedImage      `json:"patched"`
+	Patch      EnvelopePatch             `json:"patch"`
+	Results    []PatchPackageResult      `json:"results"`
+	Sink       EnvelopePatchSink         `json:"sink"`
+	Tooling    map[string]string         `json:"tooling"` // buildkitd, copa versions
+}
+
+type EnvelopePatchedImage struct {
+	Digest string `json:"digest,omitempty"`
+	Size   int64  `json:"sizeBytes,omitempty"`
+}
+
+type EnvelopePatch struct {
+	ID         string `json:"id"`
+	StartedAt  string `json:"startedAt"`
+	FinishedAt string `json:"finishedAt"`
+	Status     string `json:"status"` // SUCCESS | PARTIAL | FAILED
+}
+
+// PatchPackageResult is the outcome of a single package upgrade.
+type PatchPackageResult struct {
+	Package        string `json:"package"`
+	TargetVersion  string `json:"targetVersion"`
+	PackageManager string `json:"packageManager"`
+	Status         string `json:"status"` // SUCCESS | FAILED | SKIPPED
+	Error          string `json:"error,omitempty"`
+}
+
+// EnvelopePatchSink reports where the sensor shipped the result.
+type EnvelopePatchSink struct {
+	Kind     string `json:"kind"`
+	Location string `json:"location,omitempty"`    // registry ref or s3 key
+	URL      string `json:"url,omitempty"`         // presigned URL, if applicable
+}
+
+// Capability constants advertised in AgentRegistration.Capabilities.
+const (
+	CapScan      = "scan"
+	CapDiscovery = "discovery"
+	CapPatch     = "patch"
+)
 
 // PollResponse wraps the dashboard poll response to include cancel signals.
 type PollResponse struct {
