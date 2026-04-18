@@ -62,7 +62,7 @@ func (p *Patcher) Execute(ctx context.Context, job types.PatchJob) (*types.Patch
 		return nil, err
 	}
 
-	sinkImpl, err := sink.New(job.Job.Sink, p.S3Storage, p.SensorRegistryCreds)
+	sinkImpl, err := sink.New(job.Job.Sink, job.Job.Source.Ref, p.S3Storage, p.SensorRegistryCreds)
 	if err != nil {
 		return nil, fmt.Errorf("resolving sink: %w", err)
 	}

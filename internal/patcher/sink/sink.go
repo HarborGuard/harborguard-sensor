@@ -26,14 +26,16 @@ type Result struct {
 // New constructs a Sink from the job spec. sensorRegistryCreds are the
 // fallback credentials resolved for the sensor itself (e.g. from the
 // registry discoverer); used only for Registry sinks when the job doesn't
-// supply its own.
-func New(spec types.PatchSink, s3 *storage.S3Storage, sensorRegistryCreds *types.RegistryCredentials) (Sink, error) {
+// supply its own. sourceRef is the original image reference, used to
+// synthesize a destination repo path when the sink's Ref is a bare
+// registry host.
+func New(spec types.PatchSink, sourceRef string, s3 *storage.S3Storage, sensorRegistryCreds *types.RegistryCredentials) (Sink, error) {
 	switch spec.Kind {
 	case "registry":
 		if spec.Registry == nil {
 			return nil, fmt.Errorf("sink.registry required for kind=registry")
 		}
-		return newRegistrySink(*spec.Registry, sensorRegistryCreds), nil
+		return newRegistrySink(*spec.Registry, sourceRef, sensorRegistryCreds), nil
 	case "s3":
 		if spec.S3 == nil {
 			return nil, fmt.Errorf("sink.s3 required for kind=s3")
