@@ -358,7 +358,7 @@ type PatchEnvelope struct {
 	Patch      EnvelopePatch             `json:"patch"`
 	Results    []PatchPackageResult      `json:"results"`
 	Sink       EnvelopePatchSink         `json:"sink"`
-	Tooling    map[string]string         `json:"tooling"` // buildkitd, copa versions
+	Tooling    map[string]string         `json:"tooling"` // buildah version + runtime
 }
 
 type EnvelopePatchedImage struct {

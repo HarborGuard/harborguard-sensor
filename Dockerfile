@@ -14,13 +14,12 @@ ARG TRIVY_VERSION=v0.69.3
 ARG DOCKLE_VERSION=0.4.15
 ARG OSV_SCANNER_VERSION=v2.2.2
 ARG DIVE_VERSION=0.13.1
-ARG COPA_VERSION=0.9.0
 
-# Scanner binaries + skopeo for registry image prefetch
-# buildkit + fuse-overlayfs + copa enable optional image patching.
-# Whether patching is actually usable at runtime is decided by capability
-# probe (needs /dev/fuse or native overlay + ability to run buildkitd).
-RUN apk add --no-cache curl bash ca-certificates skopeo buildkit fuse-overlayfs \
+# Scanner binaries + skopeo for registry image prefetch.
+# buildah + fuse-overlayfs enable optional image patching. Whether patching
+# is actually usable at runtime is decided by capability probe (buildah on
+# PATH; storage driver auto-selects overlay when /dev/fuse is present, else vfs).
+RUN apk add --no-cache curl bash ca-certificates skopeo buildah fuse-overlayfs \
   && set -eux \
   && echo "Building for architecture: ${TARGETARCH:-not set}" \
   && TARGETARCH="${TARGETARCH:-amd64}" \
@@ -68,14 +67,6 @@ RUN apk add --no-cache curl bash ca-certificates skopeo buildkit fuse-overlayfs 
   && curl -L "https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}/osv-scanner_linux_${TARGETARCH}" \
        -o /usr/local/bin/osv-scanner \
   && chmod +x /usr/local/bin/osv-scanner \
-  # Install Copa (optional patching engine; sensor runs without it, scan-only)
-  && curl -L "https://github.com/project-copacetic/copacetic/releases/download/v${COPA_VERSION}/copa_${COPA_VERSION}_linux_${TARGETARCH}.tar.gz" \
-       -o /tmp/copa.tgz \
-  && tar -xzf /tmp/copa.tgz -C /usr/local/bin copa \
-  && rm /tmp/copa.tgz \
-  && chmod +x /usr/local/bin/copa \
-  # Pre-create the buildkitd socket directory
-  && mkdir -p /run/buildkit \
   && rm -rf /tmp/* /var/tmp/*
 
 # Binary

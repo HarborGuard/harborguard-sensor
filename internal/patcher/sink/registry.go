@@ -33,12 +33,12 @@ func (r *registrySink) Push(ctx context.Context, tarPath string) (*Result, error
 	var cmd string
 	var env []string
 	if r.credentials != nil && r.credentials.Username != "" {
-		cmd = fmt.Sprintf(`skopeo copy --dest-creds "${SKOPEO_DEST_CREDS}" oci-archive:%s docker://%s`, tarPath, dest)
+		cmd = fmt.Sprintf(`skopeo copy --dest-creds "${SKOPEO_DEST_CREDS}" docker-archive:%s docker://%s`, tarPath, dest)
 		env = scanner.BuildEnv(map[string]string{
 			"SKOPEO_DEST_CREDS": r.credentials.Username + ":" + r.credentials.Password,
 		})
 	} else {
-		cmd = fmt.Sprintf(`skopeo copy oci-archive:%s docker://%s`, tarPath, dest)
+		cmd = fmt.Sprintf(`skopeo copy docker-archive:%s docker://%s`, tarPath, dest)
 	}
 
 	stdout, stderr, err := scanner.ExecWithTimeout(ctx, cmd, 600000, env)

@@ -77,26 +77,19 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 		capabilities = append(capabilities, types.CapDiscovery)
 	}
 
-	// Patch capability probe. Starts buildkitd as a child process if the
-	// environment supports it; otherwise the sensor registers without
-	// "patch" and the dashboard will never dispatch patch jobs to it.
+	// Patch capability probe. The sensor shells out to buildah per job; no
+	// long-lived helper daemon to supervise. When probe fails the sensor
+	// registers without "patch" and the dashboard will never dispatch patch
+	// jobs to it.
 	var patcherInstance *patcher.Patcher
 	if canPatch, reason := patcher.Probe(); canPatch {
 		fmt.Fprintf(os.Stderr, "[agent] %s\n", reason)
-		bk, bkErr := patcher.StartBuildKit(ctx, patcher.DefaultStorageRoot(cfg.WorkDir), os.Stderr)
-		if bkErr != nil {
-			fmt.Fprintf(os.Stderr, "[agent] buildkitd failed to start: %s; registering without patch capability\n", bkErr.Error())
-		} else {
-			capabilities = append(capabilities, types.CapPatch)
-			sensorCreds := resolveSensorRegistryCreds(ctx, discoverer)
-			patcherInstance = &patcher.Patcher{
-				Config:              cfg,
-				BuildKit:            bk,
-				S3Storage:           s3store,
-				SensorRegistryCreds: sensorCreds,
-			}
-			defer func() { _ = bk.Stop() }()
-			fmt.Fprintln(os.Stderr, "[agent] buildkitd is running; patch capability enabled")
+		capabilities = append(capabilities, types.CapPatch)
+		sensorCreds := resolveSensorRegistryCreds(ctx, discoverer)
+		patcherInstance = &patcher.Patcher{
+			Config:              cfg,
+			S3Storage:           s3store,
+			SensorRegistryCreds: sensorCreds,
 		}
 	} else {
 		fmt.Fprintf(os.Stderr, "[agent] patch capability disabled: %s\n", reason)
