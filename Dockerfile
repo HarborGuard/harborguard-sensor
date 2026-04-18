@@ -19,7 +19,7 @@ ARG DIVE_VERSION=0.13.1
 # buildah + fuse-overlayfs enable optional image patching. Whether patching
 # is actually usable at runtime is decided by capability probe (buildah on
 # PATH; storage driver auto-selects overlay when /dev/fuse is present, else vfs).
-RUN apk add --no-cache curl bash ca-certificates skopeo buildah fuse-overlayfs \
+RUN apk add --no-cache curl bash ca-certificates skopeo buildah netavark fuse-overlayfs \
   && set -eux \
   && echo "Building for architecture: ${TARGETARCH:-not set}" \
   && TARGETARCH="${TARGETARCH:-amd64}" \

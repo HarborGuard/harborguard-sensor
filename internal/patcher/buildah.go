@@ -169,7 +169,7 @@ func buildahFrom(ctx context.Context, driver, sourceTar string, env []string, lo
 
 func buildahRun(ctx context.Context, driver, container, shellCmd string, env []string, logOut *os.File) error {
 	args := storageFlags(driver)
-	args = append(args, "run", container, "--", "sh", "-c", shellCmd)
+	args = append(args, "run", "--network", "host", container, "--", "sh", "-c", shellCmd)
 	_, err := runBuildahCmd(ctx, args, env, logOut, false)
 	return err
 }
