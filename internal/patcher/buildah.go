@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/HarborGuard/harborguard-sensor/internal/scanner"
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
 )
 
@@ -135,21 +134,24 @@ func runBuildah(ctx context.Context, workDir, sourceRef, outputPath, tag, osType
 }
 
 func skopeoPullToArchive(ctx context.Context, sourceRef, destTar string, creds *types.RegistryCredentials, logOut *os.File) error {
-	var cmd string
-	var env []string
+	// Direct argv — no shell. --src-creds gets the raw "user:pass" string
+	// as a single argument so nothing interprets it on the way in.
+	args := []string{"copy"}
 	if creds != nil && creds.Username != "" {
-		cmd = fmt.Sprintf(`skopeo copy --src-creds "${SKOPEO_SRC_CREDS}" docker://%s docker-archive:%s`, sourceRef, destTar)
-		env = scanner.BuildEnv(map[string]string{
-			"SKOPEO_SRC_CREDS": creds.Username + ":" + creds.Password,
-		})
-	} else {
-		cmd = fmt.Sprintf(`skopeo copy docker://%s docker-archive:%s`, sourceRef, destTar)
+		args = append(args, "--src-creds", creds.Username+":"+creds.Password)
 	}
-	stdout, stderr, err := scanner.ExecWithTimeout(ctx, cmd, skopeoPullTimeoutMs, env)
-	if err != nil {
-		return fmt.Errorf("%w (stderr: %s)", err, truncateErr(stderr))
+	args = append(args, "docker://"+sourceRef, "docker-archive:"+destTar)
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(skopeoPullTimeoutMs)*time.Millisecond)
+	defer cancel()
+
+	var stderr strings.Builder
+	cmd := exec.CommandContext(timeoutCtx, skopeoBinary, args...)
+	cmd.Stdout = logOut
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("skopeo copy: %w (stderr: %s)", err, truncateErr(stderr.String()))
 	}
-	fmt.Fprint(logOut, stdout)
 	return nil
 }
 

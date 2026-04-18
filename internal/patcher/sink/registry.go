@@ -1,11 +1,13 @@
 package sink
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os/exec"
 	"strings"
+	"time"
 
-	"github.com/HarborGuard/harborguard-sensor/internal/scanner"
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
 )
 
@@ -30,23 +32,28 @@ func (r *registrySink) Push(ctx context.Context, tarPath string) (*Result, error
 	}
 	dest := fmt.Sprintf("%s:%s", strings.TrimSuffix(r.ref, ":"), r.tag)
 
-	var cmd string
-	var env []string
+	// Invoke skopeo directly via argv — no shell in between. Credentials go
+	// as a single literal argument to --dest-creds, avoiding any shell
+	// quoting or variable-expansion failure mode.
+	args := []string{"copy"}
 	if r.credentials != nil && r.credentials.Username != "" {
-		cmd = fmt.Sprintf(`skopeo copy --dest-creds "${SKOPEO_DEST_CREDS}" docker-archive:%s docker://%s`, tarPath, dest)
-		env = scanner.BuildEnv(map[string]string{
-			"SKOPEO_DEST_CREDS": r.credentials.Username + ":" + r.credentials.Password,
-		})
-	} else {
-		cmd = fmt.Sprintf(`skopeo copy docker-archive:%s docker://%s`, tarPath, dest)
+		args = append(args, "--dest-creds", r.credentials.Username+":"+r.credentials.Password)
+	}
+	args = append(args, "docker-archive:"+tarPath, "docker://"+dest)
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(timeoutCtx, "skopeo", args...)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("skopeo copy failed: %w (stderr: %s)", err, trim(stderr.String()))
 	}
 
-	stdout, stderr, err := scanner.ExecWithTimeout(ctx, cmd, 600000, env)
-	if err != nil {
-		return nil, fmt.Errorf("skopeo copy failed: %w (stderr: %s)", err, trim(stderr))
-	}
-
-	digest := parseSkopeoDigest(stdout + stderr)
+	digest := parseSkopeoDigest(stdout.String() + stderr.String())
 	return &Result{Location: dest, Digest: digest}, nil
 }
 
