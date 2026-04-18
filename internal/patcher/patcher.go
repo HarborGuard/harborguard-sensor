@@ -49,7 +49,15 @@ func (p *Patcher) Execute(ctx context.Context, job types.PatchJob) (*types.Patch
 	fmt.Fprintf(os.Stderr, "[patcher] %s: invoking buildah (os=%s, packages=%d)\n",
 		job.ID, osType, len(job.Job.Packages))
 
-	result, err := runBuildah(ctx, workDir, job.Job.Source.Ref, tarPath, tag, osType, job.Job.Packages, job.Job.SourceCredentials, nil)
+	// Pull credentials: prefer the job's inline creds, fall back to the
+	// sensor's own registry creds (from the discoverer). Matches the push
+	// path behavior in sink.New, so an ECR dashboard can dispatch a patch
+	// job without re-embedding a short-lived token.
+	pullCreds := job.Job.SourceCredentials
+	if pullCreds == nil {
+		pullCreds = p.SensorRegistryCreds
+	}
+	result, err := runBuildah(ctx, workDir, job.Job.Source.Ref, tarPath, tag, osType, job.Job.Packages, pullCreds, nil)
 	if err != nil {
 		return nil, err
 	}
