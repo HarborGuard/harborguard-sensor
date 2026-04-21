@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -251,20 +253,28 @@ func (o *Orchestrator) prefetchRegistryImage(ctx context.Context, source types.I
 	tarPath := filepath.Join(outputDir, "prefetch.tar")
 	ref := source.Ref
 
-	var cmd string
-	var env []string
-
+	// Invoke skopeo directly via argv. Passing --src-creds as a literal
+	// argument avoids a /bin/sh -c expansion layer that has caused
+	// hard-to-debug "invalid credentials" rejections on ECR.
+	args := []string{"copy"}
 	if user := o.RegistryCreds["TRIVY_USERNAME"]; user != "" {
 		pass := o.RegistryCreds["TRIVY_PASSWORD"]
-		cmd = fmt.Sprintf(`skopeo copy --src-creds "${SKOPEO_CREDS}" docker://%s docker-archive:%s`, ref, tarPath)
-		env = BuildEnv(map[string]string{"SKOPEO_CREDS": user + ":" + pass})
-	} else {
-		cmd = fmt.Sprintf(`skopeo copy docker://%s docker-archive:%s`, ref, tarPath)
+		args = append(args, "--src-creds", user+":"+pass)
 	}
+	args = append(args, "docker://"+ref, "docker-archive:"+tarPath)
 
-	_, _, err := ExecWithTimeout(ctx, cmd, 300000, env)
-	if err != nil {
-		return "", fmt.Errorf("prefetch failed: %w", err)
+	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	var stderr strings.Builder
+	cmd := exec.CommandContext(timeoutCtx, "skopeo", args...)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if len(msg) > 500 {
+			msg = msg[:500] + "..."
+		}
+		return "", fmt.Errorf("prefetch failed: %w (stderr: %s)", err, msg)
 	}
 	return tarPath, nil
 }
