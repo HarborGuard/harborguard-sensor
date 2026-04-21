@@ -257,8 +257,7 @@ func (o *Orchestrator) prefetchRegistryImage(ctx context.Context, source types.I
 	// argument avoids a /bin/sh -c expansion layer that has caused
 	// hard-to-debug "invalid credentials" rejections on ECR.
 	args := []string{"copy"}
-	if user := o.RegistryCreds["TRIVY_USERNAME"]; user != "" {
-		pass := o.RegistryCreds["TRIVY_PASSWORD"]
+	if user, pass := resolveRegistryCreds(o.RegistryCreds); user != "" {
 		args = append(args, "--src-creds", user+":"+pass)
 	}
 	args = append(args, "docker://"+ref, "docker-archive:"+tarPath)
@@ -376,4 +375,28 @@ func extractImageMetadata(results map[string]*types.ScannerResult) types.ScanOut
 		ImagePlatform:   imagePlatform,
 		ImageSizeBytes:  imageSizeBytes,
 	}
+}
+
+// resolveRegistryCreds picks the user/pass pair for the skopeo source-pull in
+// priority order:
+//   1. Orchestrator.RegistryCreds (populated by agent.setupRegistryCreds from
+//      dashboard-dispatched job credentials + discoverer fallback).
+//   2. REGISTRY_USER / REGISTRY_PASS environment variables (CLI dispatch
+//      convention used by the dashboard worker when spawning a Fly machine).
+//   3. TRIVY_USERNAME / TRIVY_PASSWORD environment variables (fallback for
+//      operators who pass trivy-style env only).
+//
+// Returns ("", "") when no credentials are available; skopeo will then try an
+// anonymous pull, which is correct for public images.
+func resolveRegistryCreds(rc map[string]string) (string, string) {
+	if u := rc["TRIVY_USERNAME"]; u != "" {
+		return u, rc["TRIVY_PASSWORD"]
+	}
+	if u := os.Getenv("REGISTRY_USER"); u != "" {
+		return u, os.Getenv("REGISTRY_PASS")
+	}
+	if u := os.Getenv("TRIVY_USERNAME"); u != "" {
+		return u, os.Getenv("TRIVY_PASSWORD")
+	}
+	return "", ""
 }
