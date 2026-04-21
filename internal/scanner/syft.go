@@ -76,6 +76,12 @@ func (s *SyftScanner) IsAvailable() bool {
 	return IsToolAvailable("syft")
 }
 
-func (s *SyftScanner) SupportsSource(_ types.ImageSource) bool {
-	return true
+// SupportsSource declines "registry" so the orchestrator routes syft through
+// the skopeo prefetch → tar path used by dive. This consolidates all
+// registry auth into a single skopeo invocation (which reads
+// REGISTRY_USER/REGISTRY_PASS or the agent-populated RegistryCreds map) and
+// avoids syft needing its own SYFT_REGISTRY_AUTH_* env vars that CLI
+// dispatchers historically didn't set.
+func (s *SyftScanner) SupportsSource(source types.ImageSource) bool {
+	return source.Type != "registry"
 }

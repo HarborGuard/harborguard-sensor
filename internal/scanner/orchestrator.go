@@ -63,8 +63,12 @@ func (o *Orchestrator) Execute(ctx context.Context, job types.ScanJob) (*types.S
 
 	// For registry source, prefetch image and run incompatible scanners on tar
 	if job.Source.Type == "registry" && len(incompatible) > 0 {
-		fmt.Fprintf(os.Stderr, "[orchestrator] Prefetching %s for %d incompatible scanner(s)...\n",
-			job.Source.Ref, len(incompatible))
+		names := make([]string, len(incompatible))
+		for i, s := range incompatible {
+			names[i] = s.Name()
+		}
+		fmt.Fprintf(os.Stderr, "[orchestrator] Prefetching %s for %d scanner(s): %v\n",
+			job.Source.Ref, len(incompatible), names)
 		tarPath, err := o.prefetchRegistryImage(ctx, job.Source, outputDir)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -80,10 +84,20 @@ func (o *Orchestrator) Execute(ctx context.Context, job types.ScanJob) (*types.S
 				}
 			}
 		} else {
+			var tarSize int64
+			if fi, statErr := os.Stat(tarPath); statErr == nil {
+				tarSize = fi.Size()
+			}
+			fmt.Fprintf(os.Stderr, "[orchestrator] Prefetch complete: %s (%d bytes). Running %v against tar.\n",
+				tarPath, tarSize, names)
 			// Run incompatible scanners against the tar
 			tarSource := types.ImageSource{Type: "tar", Path: tarPath}
 			tarResults := o.runParallel(ctx, incompatible, tarSource, outputDir)
 			for name, result := range tarResults {
+				if !result.Success {
+					fmt.Fprintf(os.Stderr, "[orchestrator] Scanner %s on prefetched tar failed: %s\n",
+						name, result.Error)
+				}
 				results[name] = result
 			}
 			// Clean up tar file
@@ -257,8 +271,13 @@ func (o *Orchestrator) prefetchRegistryImage(ctx context.Context, source types.I
 	// argument avoids a /bin/sh -c expansion layer that has caused
 	// hard-to-debug "invalid credentials" rejections on ECR.
 	args := []string{"copy"}
-	if user, pass := resolveRegistryCreds(o.RegistryCreds); user != "" {
+	user, pass, credSource := resolveRegistryCredsSource(o.RegistryCreds)
+	if user != "" {
 		args = append(args, "--src-creds", user+":"+pass)
+		fmt.Fprintf(os.Stderr, "[orchestrator] Prefetch auth: user=%s source=%s (pass=%d chars)\n",
+			user, credSource, len(pass))
+	} else {
+		fmt.Fprintf(os.Stderr, "[orchestrator] Prefetch auth: anonymous (no credentials in RegistryCreds/REGISTRY_USER/TRIVY_USERNAME)\n")
 	}
 	args = append(args, "docker://"+ref, "docker-archive:"+tarPath)
 
@@ -389,14 +408,21 @@ func extractImageMetadata(results map[string]*types.ScannerResult) types.ScanOut
 // Returns ("", "") when no credentials are available; skopeo will then try an
 // anonymous pull, which is correct for public images.
 func resolveRegistryCreds(rc map[string]string) (string, string) {
+	u, p, _ := resolveRegistryCredsSource(rc)
+	return u, p
+}
+
+// resolveRegistryCredsSource returns the same creds plus a label describing
+// which source supplied them, for log visibility.
+func resolveRegistryCredsSource(rc map[string]string) (string, string, string) {
 	if u := rc["TRIVY_USERNAME"]; u != "" {
-		return u, rc["TRIVY_PASSWORD"]
+		return u, rc["TRIVY_PASSWORD"], "RegistryCreds"
 	}
 	if u := os.Getenv("REGISTRY_USER"); u != "" {
-		return u, os.Getenv("REGISTRY_PASS")
+		return u, os.Getenv("REGISTRY_PASS"), "env:REGISTRY_USER"
 	}
 	if u := os.Getenv("TRIVY_USERNAME"); u != "" {
-		return u, os.Getenv("TRIVY_PASSWORD")
+		return u, os.Getenv("TRIVY_PASSWORD"), "env:TRIVY_USERNAME"
 	}
-	return "", ""
+	return "", "", "none"
 }
