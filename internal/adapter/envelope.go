@@ -1,6 +1,8 @@
 package adapter
 
 import (
+	"fmt"
+	"os"
 	"strings"
 
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
@@ -18,9 +20,16 @@ func BuildEnvelope(job types.ScanJob, output *types.ScanOutput) *types.ScanEnvel
 
 	for scanner, result := range output.Results {
 		if !result.Success || result.Data == nil {
+			if result.Success && result.Data == nil {
+				fmt.Fprintf(os.Stderr, "[envelope] skipping %s: Success=true but Data=nil\n", scanner)
+			}
 			continue
 		}
 		data := result.Data
+
+		before := struct{ vulns, pkgs, compl, eff, layers int }{
+			len(vulnerabilities), len(packages), len(compliance), len(efficiency), len(layers),
+		}
 
 		switch scanner {
 		case "trivy":
@@ -38,6 +47,15 @@ func BuildEnvelope(job types.ScanJob, output *types.ScanOutput) *types.ScanEnvel
 		case "osv":
 			vulnerabilities = append(vulnerabilities, ExtractOsvVulnerabilities(data)...)
 		}
+
+		fmt.Fprintf(os.Stderr, "[envelope] %s contributed: +%d vulns, +%d pkgs, +%d compliance, +%d efficiency, +%d layers\n",
+			scanner,
+			len(vulnerabilities)-before.vulns,
+			len(packages)-before.pkgs,
+			len(compliance)-before.compl,
+			len(efficiency)-before.eff,
+			len(layers)-before.layers,
+		)
 	}
 
 	deduped := deduplicateVulnerabilities(vulnerabilities)
@@ -111,6 +129,9 @@ func BuildEnvelope(job types.ScanJob, output *types.ScanOutput) *types.ScanEnvel
 	if layers == nil {
 		layers = []types.EnvelopeLayer{}
 	}
+
+	fmt.Fprintf(os.Stderr, "[envelope] final: %d vulns (%d after dedupe), %d pkgs, %d compliance, %d efficiency, %d layers\n",
+		len(vulnerabilities), len(deduped), len(packages), len(compliance), len(efficiency), len(layers))
 
 	return &types.ScanEnvelope{
 		Version: "1.0",

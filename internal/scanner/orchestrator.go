@@ -94,10 +94,14 @@ func (o *Orchestrator) Execute(ctx context.Context, job types.ScanJob) (*types.S
 			tarSource := types.ImageSource{Type: "tar", Path: tarPath}
 			tarResults := o.runParallel(ctx, incompatible, tarSource, outputDir)
 			for name, result := range tarResults {
-				if !result.Success {
-					fmt.Fprintf(os.Stderr, "[orchestrator] Scanner %s on prefetched tar failed: %s\n",
-						name, result.Error)
+				outputFile := filepath.Join(outputDir, name+".json")
+				var outSize int64
+				if fi, statErr := os.Stat(outputFile); statErr == nil {
+					outSize = fi.Size()
 				}
+				dataShape := describeDataShape(result.Data)
+				fmt.Fprintf(os.Stderr, "[orchestrator] Scanner %s on tar: success=%t err=%q outfile=%dB data=%s\n",
+					name, result.Success, result.Error, outSize, dataShape)
 				results[name] = result
 			}
 			// Clean up tar file
@@ -410,6 +414,27 @@ func extractImageMetadata(results map[string]*types.ScannerResult) types.ScanOut
 func resolveRegistryCreds(rc map[string]string) (string, string) {
 	u, p, _ := resolveRegistryCredsSource(rc)
 	return u, p
+}
+
+// describeDataShape returns a compact description of a scanner's parsed Data
+// field so operators can tell at a glance whether the JSON parsed but is
+// structurally different from what the envelope adapters expect.
+func describeDataShape(data interface{}) string {
+	if data == nil {
+		return "nil"
+	}
+	switch v := data.(type) {
+	case map[string]interface{}:
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		return fmt.Sprintf("object(%d keys: %v)", len(v), keys)
+	case []interface{}:
+		return fmt.Sprintf("array(%d elements)", len(v))
+	default:
+		return fmt.Sprintf("%T", v)
+	}
 }
 
 // resolveRegistryCredsSource returns the same creds plus a label describing
