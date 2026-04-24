@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/HarborGuard/harborguard-sensor/internal/patcher/sink"
+	"github.com/HarborGuard/harborguard-sensor/internal/scanner"
 	"github.com/HarborGuard/harborguard-sensor/internal/storage"
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
 )
@@ -26,6 +27,26 @@ type Patcher struct {
 // Execute runs the full patch pipeline and returns an envelope describing
 // the outcome. On any error before completion, workDir is cleaned up.
 func (p *Patcher) Execute(ctx context.Context, job types.PatchJob) (*types.PatchEnvelope, error) {
+	// Defensive normalization — the agent loop strips schemes at the
+	// boundary, but any direct caller of Execute needs this too.
+	// Idempotent, so the second strip is a no-op for normalized input.
+	if normalized, insecure, _ := scanner.NormalizeImageRef(job.Job.Source.Ref); normalized != job.Job.Source.Ref {
+		job.Job.Source.Ref = normalized
+		if insecure {
+			job.Job.Source.Insecure = true
+		}
+	}
+	if job.Job.Sink.Kind == "registry" && job.Job.Sink.Registry != nil {
+		spec := *job.Job.Sink.Registry
+		if normalized, insecure, _ := scanner.NormalizeImageRef(spec.Ref); normalized != spec.Ref {
+			spec.Ref = normalized
+			if insecure {
+				spec.Insecure = true
+			}
+			job.Job.Sink.Registry = &spec
+		}
+	}
+
 	if err := validateJob(job); err != nil {
 		return nil, err
 	}
@@ -46,8 +67,8 @@ func (p *Patcher) Execute(ctx context.Context, job types.PatchJob) (*types.Patch
 	tag := patchTag(job)
 	tarPath := filepath.Join(workDir, "patched.tar")
 
-	fmt.Fprintf(os.Stderr, "[patcher] %s: invoking buildah (os=%s, packages=%d)\n",
-		job.ID, osType, len(job.Job.Packages))
+	fmt.Fprintf(os.Stderr, "[patcher] %s: invoking buildah (os=%s, packages=%d, insecure=%t)\n",
+		job.ID, osType, len(job.Job.Packages), job.Job.Source.Insecure)
 
 	// Pull credentials: prefer the job's inline creds, fall back to the
 	// sensor's own registry creds (from the discoverer). Matches the push
@@ -57,7 +78,7 @@ func (p *Patcher) Execute(ctx context.Context, job types.PatchJob) (*types.Patch
 	if pullCreds == nil {
 		pullCreds = p.SensorRegistryCreds
 	}
-	result, err := runBuildah(ctx, workDir, job.Job.Source.Ref, tarPath, tag, osType, job.Job.Packages, pullCreds, nil)
+	result, err := runBuildah(ctx, workDir, job.Job.Source.Ref, job.Job.Source.Insecure, tarPath, tag, osType, job.Job.Packages, pullCreds, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +164,7 @@ func (p *Patcher) resolveOSType(ctx context.Context, job types.PatchJob) (string
 			return os, nil
 		}
 	}
-	return DetectOS(ctx, job.Job.Source.Ref)
+	return DetectOS(ctx, job.Job.Source.Ref, job.Job.Source.Insecure)
 }
 
 // OSTypeFromPackageManager maps a pm identifier to an OS family string. This

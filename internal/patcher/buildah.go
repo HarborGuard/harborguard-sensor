@@ -32,13 +32,15 @@ type patchResult struct {
 
 // runBuildah pulls the source image to a docker-archive, applies package
 // upgrades via buildah, and writes a patched docker-archive to outputPath.
-func runBuildah(ctx context.Context, workDir, sourceRef, outputPath, tag, osType string, packages []types.PatchPackage, sourceCreds *types.RegistryCredentials, logOut *os.File) (*patchResult, error) {
+// sourceInsecure signals that the source registry was http:// — adds
+// --src-tls-verify=false to the skopeo pull.
+func runBuildah(ctx context.Context, workDir, sourceRef string, sourceInsecure bool, outputPath, tag, osType string, packages []types.PatchPackage, sourceCreds *types.RegistryCredentials, logOut *os.File) (*patchResult, error) {
 	if logOut == nil {
 		logOut = os.Stderr
 	}
 
 	sourceTar := filepath.Join(workDir, "source.tar")
-	if err := skopeoPullToArchive(ctx, sourceRef, sourceTar, sourceCreds, logOut); err != nil {
+	if err := skopeoPullToArchive(ctx, sourceRef, sourceInsecure, sourceTar, sourceCreds, logOut); err != nil {
 		return nil, fmt.Errorf("pulling source image: %w", err)
 	}
 	defer func() { _ = os.Remove(sourceTar) }()
@@ -133,10 +135,13 @@ func runBuildah(ctx context.Context, workDir, sourceRef, outputPath, tag, osType
 	return result, nil
 }
 
-func skopeoPullToArchive(ctx context.Context, sourceRef, destTar string, creds *types.RegistryCredentials, logOut *os.File) error {
+func skopeoPullToArchive(ctx context.Context, sourceRef string, insecure bool, destTar string, creds *types.RegistryCredentials, logOut *os.File) error {
 	// Direct argv — no shell. --src-creds gets the raw "user:pass" string
 	// as a single argument so nothing interprets it on the way in.
 	args := []string{"copy"}
+	if insecure {
+		args = append(args, "--src-tls-verify=false")
+	}
 	if creds != nil && creds.Username != "" {
 		args = append(args, "--src-creds", creds.Username+":"+creds.Password)
 	}

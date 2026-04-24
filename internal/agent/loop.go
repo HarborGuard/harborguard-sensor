@@ -295,14 +295,18 @@ func processJob(ctx context.Context, client *AgentClient, orch *scanner.Orchestr
 	if err != nil {
 		msg := err.Error()
 		fmt.Fprintf(os.Stderr, "[agent] Scan failed: %s\n", msg)
-		_ = client.ReportJobStatus(job.ID, "failed", msg)
+		if reportErr := client.ReportJobStatus(job.ID, "failed", msg); reportErr != nil {
+			fmt.Fprintf(os.Stderr, "[agent] Status report (failed) did not reach dashboard: %s\n", reportErr.Error())
+		}
 		return
 	}
 
 	// If cancelled, report status and skip uploads
 	if output.Cancelled {
 		fmt.Fprintf(os.Stderr, "[agent] Scan cancelled: %s\n", imageRef)
-		_ = client.ReportJobStatus(job.ID, "cancelled", "")
+		if reportErr := client.ReportJobStatus(job.ID, "cancelled", ""); reportErr != nil {
+			fmt.Fprintf(os.Stderr, "[agent] Status report (cancelled) did not reach dashboard: %s\n", reportErr.Error())
+		}
 		return
 	}
 
@@ -346,7 +350,9 @@ func processJob(ctx context.Context, client *AgentClient, orch *scanner.Orchestr
 	// with 0 findings" for scans where no scanner actually ran.
 	if _, _, err := client.UploadResults(envelope); err != nil {
 		fmt.Fprintf(os.Stderr, "[agent] Upload failed: %s\n", err.Error())
-		_ = client.ReportJobStatus(job.ID, "failed", err.Error())
+		if reportErr := client.ReportJobStatus(job.ID, "failed", err.Error()); reportErr != nil {
+			fmt.Fprintf(os.Stderr, "[agent] Status report (failed) did not reach dashboard: %s\n", reportErr.Error())
+		}
 		return
 	}
 
@@ -389,30 +395,69 @@ func summarizeScannerFailures(results map[string]*types.ScannerResult) string {
 }
 
 func processPatchJob(ctx context.Context, client *AgentClient, p *patcher.Patcher, job types.AgentJob) {
-	patch := job.Patch
+	patch := *job.Patch // copy so our mutations don't leak into the poll-response struct
+
+	// Normalize source and sink registry refs once at the boundary. Without
+	// this, `docker://` + "http://..." produces an invalid skopeo URI and
+	// skopeo copy fails with "Invalid source name". The nested patch value
+	// is a copy, so these mutations stay local to this job.
+	if normalized, insecure, _ := scanner.NormalizeImageRef(patch.Source.Ref); normalized != patch.Source.Ref {
+		patch.Source.Ref = normalized
+		if insecure {
+			patch.Source.Insecure = true
+		}
+	}
+	if patch.Sink.Kind == "registry" && patch.Sink.Registry != nil {
+		spec := *patch.Sink.Registry
+		if normalized, insecure, _ := scanner.NormalizeImageRef(spec.Ref); normalized != spec.Ref {
+			spec.Ref = normalized
+			if insecure {
+				spec.Insecure = true
+			}
+			patch.Sink.Registry = &spec
+		}
+	}
+
 	fmt.Fprintf(os.Stderr, "[agent] Starting patch: %s -> sink=%s\n", patch.Source.Ref, patch.Sink.Kind)
 
 	envelope, err := p.Execute(ctx, types.PatchJob{
 		ID:  job.ID,
-		Job: *patch,
+		Job: patch,
 	})
 	if err != nil {
 		msg := err.Error()
 		fmt.Fprintf(os.Stderr, "[agent] Patch failed: %s\n", msg)
-		_ = client.ReportJobStatus(job.ID, "failed", msg)
+		if reportErr := client.ReportJobStatus(job.ID, "failed", msg); reportErr != nil {
+			fmt.Fprintf(os.Stderr, "[agent] Patch status report (failed) did not reach dashboard: %s\n", reportErr.Error())
+		}
 		return
 	}
 
 	if _, err := client.UploadPatchResult(envelope); err != nil {
 		fmt.Fprintf(os.Stderr, "[agent] Patch upload failed: %s\n", err.Error())
-		_ = client.ReportJobStatus(job.ID, "failed", err.Error())
+		if reportErr := client.ReportJobStatus(job.ID, "failed", err.Error()); reportErr != nil {
+			fmt.Fprintf(os.Stderr, "[agent] Patch status report (failed) did not reach dashboard: %s\n", reportErr.Error())
+		}
 		return
 	}
 
-	if err := client.ReportJobStatus(job.ID, "completed", ""); err != nil {
-		fmt.Fprintf(os.Stderr, "[agent] Patch status report failed: %s\n", err.Error())
+	// A patch where every package install failed still produces a
+	// docker-archive and pushes to the sink (buildah commits the
+	// unmodified container), so runBuildah returns (result, nil) — the
+	// dashboard previously saw this as a successful completion. Flip to
+	// "failed" when the envelope itself carries Patch.Status=FAILED so
+	// the patch_operations row reflects reality. PARTIAL still reports
+	// as "completed" — some packages did land.
+	status := "completed"
+	errMsg := ""
+	if envelope.Patch.Status == "FAILED" {
+		status = "failed"
+		errMsg = "all packages failed to install (see result entries)"
 	}
-	fmt.Fprintf(os.Stderr, "[agent] Patch complete: %s -> %s\n", patch.Source.Ref, envelope.Sink.Location)
+	if err := client.ReportJobStatus(job.ID, status, errMsg); err != nil {
+		fmt.Fprintf(os.Stderr, "[agent] Patch status report (%s) did not reach dashboard: %s\n", status, err.Error())
+	}
+	fmt.Fprintf(os.Stderr, "[agent] Patch %s: %s -> %s\n", status, patch.Source.Ref, envelope.Sink.Location)
 }
 
 // resolveSensorRegistryCreds pulls out the sensor-level registry credentials

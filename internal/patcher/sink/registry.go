@@ -16,6 +16,7 @@ type registrySink struct {
 	ref         string
 	tag         string
 	sourceRef   string
+	insecure    bool
 	credentials *types.RegistryCredentials
 }
 
@@ -24,7 +25,13 @@ func newRegistrySink(spec types.PatchSinkRegistry, sourceRef string, sensorCreds
 	if creds == nil {
 		creds = sensorCreds
 	}
-	return &registrySink{ref: spec.Ref, tag: spec.Tag, sourceRef: sourceRef, credentials: creds}
+	return &registrySink{
+		ref:         spec.Ref,
+		tag:         spec.Tag,
+		sourceRef:   sourceRef,
+		insecure:    spec.Insecure,
+		credentials: creds,
+	}
 }
 
 func (r *registrySink) Push(ctx context.Context, tarPath string) (*Result, error) {
@@ -41,6 +48,9 @@ func (r *registrySink) Push(ctx context.Context, tarPath string) (*Result, error
 	// as a single literal argument to --dest-creds, avoiding any shell
 	// quoting or variable-expansion failure mode.
 	args := []string{"copy"}
+	if r.insecure {
+		args = append(args, "--dest-tls-verify=false")
+	}
 	if r.credentials != nil && r.credentials.Username != "" {
 		args = append(args, "--dest-creds", r.credentials.Username+":"+r.credentials.Password)
 	}

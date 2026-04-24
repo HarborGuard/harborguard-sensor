@@ -20,12 +20,14 @@ import (
 //  2. skopeo inspect labels (org.opencontainers.image.base.name, etc).
 //
 // Callers should prefer caller-supplied hints (StrategyHint, PackageManager)
-// over this function and fall back here only when those are absent.
-func DetectOS(ctx context.Context, imageRef string) (string, error) {
+// over this function and fall back here only when those are absent. When
+// the source registry is http, pass insecure=true so the skopeo inspect
+// probe can reach it.
+func DetectOS(ctx context.Context, imageRef string, insecure bool) (string, error) {
 	if fam := osFromName(imageRef); fam != "" {
 		return fam, nil
 	}
-	if fam, err := osFromSkopeoLabels(ctx, imageRef); err == nil && fam != "" {
+	if fam, err := osFromSkopeoLabels(ctx, imageRef, insecure); err == nil && fam != "" {
 		return fam, nil
 	}
 	return "", fmt.Errorf("could not detect OS for %s; supply strategyHint or packageManager on packages", imageRef)
@@ -60,8 +62,12 @@ var nameHints = map[string]string{
 
 // osFromSkopeoLabels pulls the image config via skopeo inspect and scans
 // well-known labels for a distro identifier.
-func osFromSkopeoLabels(ctx context.Context, imageRef string) (string, error) {
-	cmd := fmt.Sprintf("skopeo inspect --config docker://%s", imageRef)
+func osFromSkopeoLabels(ctx context.Context, imageRef string, insecure bool) (string, error) {
+	tlsFlag := ""
+	if insecure {
+		tlsFlag = "--tls-verify=false "
+	}
+	cmd := fmt.Sprintf("skopeo inspect %s--config docker://%s", tlsFlag, imageRef)
 	stdout, stderr, err := scanner.ExecWithTimeout(ctx, cmd, 15000, nil)
 	if err != nil {
 		return "", fmt.Errorf("skopeo inspect: %w (stderr: %s)", err, strings.TrimSpace(stderr))

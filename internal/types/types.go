@@ -332,10 +332,16 @@ type PatchSink struct {
 }
 
 // PatchSinkRegistry pushes the patched image to a container registry.
+//
+// Insecure is set by the agent when the supplied Ref carries an http://
+// scheme (stripped before reaching skopeo) and tells the sink to add
+// --dest-tls-verify=false on the push. Mirrors ImageSource.Insecure on
+// the pull side.
 type PatchSinkRegistry struct {
 	Ref         string               `json:"ref"`                   // e.g. registry.example.com/app
 	Tag         string               `json:"tag"`                   // required; sensor never picks a tag
 	Credentials *RegistryCredentials `json:"credentials,omitempty"` // optional; falls back to sensor creds
+	Insecure    bool                 `json:"insecure,omitempty"`
 }
 
 // PatchSinkS3 uploads the patched image tarball to S3 under keyPrefix.
