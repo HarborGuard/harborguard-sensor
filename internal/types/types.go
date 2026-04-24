@@ -16,11 +16,19 @@ const (
 )
 
 // RegistryConfig holds configuration for registry discovery.
+//
+// Insecure is set from HG_REGISTRY_INSECURE and tells the discovery
+// client to talk plain http to the registry's v2 endpoints (when no
+// scheme is on URL) and to skip TLS verification when an https endpoint
+// is reached anyway (e.g. via WWW-Authenticate redirect to a separate
+// auth server). An explicit https:// scheme on URL always wins —
+// Insecure only governs the otherwise-default scheme choice.
 type RegistryConfig struct {
 	URL                 string
 	Username            string
 	Token               string
 	DiscoveryIntervalMs int
+	Insecure            bool
 }
 
 // ResolvedCredentials holds registry credentials with optional expiry for token refresh.
@@ -245,6 +253,7 @@ type SensorConfig struct {
 	RegistryURL           string
 	RegistryUsername      string
 	RegistryToken         string
+	RegistryInsecure      bool
 	DiscoveryIntervalMs   int
 }
 

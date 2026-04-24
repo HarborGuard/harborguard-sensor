@@ -35,7 +35,7 @@ func NewDiscoverer(cfg types.RegistryConfig) (*Discoverer, error) {
 			return nil, fmt.Errorf("initializing ECR provider: %w", err)
 		}
 	default:
-		provider = NewOCIProvider(cfg.URL, providerType, credResolver)
+		provider = NewOCIProvider(cfg.URL, providerType, credResolver, cfg.Insecure)
 	}
 
 	return &Discoverer{
@@ -47,8 +47,8 @@ func NewDiscoverer(cfg types.RegistryConfig) (*Discoverer, error) {
 
 // Discover runs a single discovery cycle: lists all repos and their tags.
 func (d *Discoverer) Discover(ctx context.Context) ([]types.DiscoveredRepository, error) {
-	fmt.Fprintf(os.Stderr, "[discovery] Starting catalog discovery for %s (%s)\n",
-		d.cfg.URL, d.provider.Name())
+	fmt.Fprintf(os.Stderr, "[discovery] Starting catalog discovery for %s (%s, insecure=%t)\n",
+		d.cfg.URL, d.provider.Name(), d.cfg.Insecure)
 
 	repos, err := d.provider.ListRepositories(ctx)
 	if err != nil {

@@ -2,10 +2,12 @@ package registry
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,7 @@ type OCIProvider struct {
 	providerType types.RegistryProvider
 	creds        *CredentialResolver
 	httpClient   *http.Client
+	insecure     bool
 
 	// Bearer token cache
 	tokenMu    sync.Mutex
@@ -30,13 +33,23 @@ type bearerToken struct {
 	ExpiresAt time.Time
 }
 
-// NewOCIProvider creates a generic OCI registry provider.
-func NewOCIProvider(registryURL string, providerType types.RegistryProvider, creds *CredentialResolver) *OCIProvider {
+// NewOCIProvider creates a generic OCI registry provider. When insecure is
+// true and registryURL has no scheme, http:// is used (instead of the
+// default https://); the http.Client also skips TLS verification so that
+// any https endpoint reached via WWW-Authenticate redirect still works.
+func NewOCIProvider(registryURL string, providerType types.RegistryProvider, creds *CredentialResolver, insecure bool) *OCIProvider {
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	if insecure {
+		httpClient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+	}
 	return &OCIProvider{
-		registryURL:  normalizeRegistryURL(registryURL),
+		registryURL:  normalizeRegistryURL(registryURL, insecure),
 		providerType: providerType,
 		creds:        creds,
-		httpClient:   &http.Client{Timeout: 30 * time.Second},
+		httpClient:   httpClient,
+		insecure:     insecure,
 		tokenCache:   make(map[string]*bearerToken),
 	}
 }
@@ -190,6 +203,15 @@ func (o *OCIProvider) fetchBearerToken(ctx context.Context, challenge, scope, ba
 		return "", fmt.Errorf("no realm in bearer challenge")
 	}
 
+	// Forensic visibility: when the discovery client is in insecure mode,
+	// the realm URL came from the registry's WWW-Authenticate header and
+	// can point to an arbitrary auth server. We send basic-auth there
+	// over a TLS-skip connection — surface that in the log so an
+	// operator can audit which realm we trusted.
+	if o.insecure {
+		fmt.Fprintf(os.Stderr, "[oci] insecure: skipping TLS verify on bearer realm %s\n", realm)
+	}
+
 	// Build token request URL
 	tokenURL := realm
 	sep := "?"
@@ -321,10 +343,17 @@ func parseBearerChallenge(challenge string) map[string]string {
 	return params
 }
 
-// normalizeRegistryURL ensures the URL has an https:// scheme and no trailing slash.
-func normalizeRegistryURL(rawURL string) string {
+// normalizeRegistryURL ensures the URL has a scheme and no trailing slash.
+// An explicit scheme on rawURL is preserved (so https://... always means
+// HTTPS even when insecure=true). When no scheme is present, http:// is
+// chosen if insecure, otherwise https://.
+func normalizeRegistryURL(rawURL string, insecure bool) string {
 	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
-		rawURL = "https://" + rawURL
+		scheme := "https://"
+		if insecure {
+			scheme = "http://"
+		}
+		rawURL = scheme + rawURL
 	}
 	return strings.TrimRight(rawURL, "/")
 }

@@ -145,6 +145,7 @@ func LoadConfig(overrides map[string]string) (*types.SensorConfig, error) {
 	}
 	registryUsername := envOr([]string{"HG_REGISTRY_USER", "REGISTRY_USER"}, "")
 	registryToken := envOr([]string{"HG_REGISTRY_TOKEN", "REGISTRY_TOKEN"}, "")
+	registryInsecure := parseTruthy(envOr([]string{"HG_REGISTRY_INSECURE", "REGISTRY_INSECURE"}, ""))
 
 	discoveryIntervalRaw := override("discoveryInterval")
 	if discoveryIntervalRaw == "" {
@@ -208,8 +209,19 @@ func LoadConfig(overrides map[string]string) (*types.SensorConfig, error) {
 		RegistryURL:           registryURL,
 		RegistryUsername:      registryUsername,
 		RegistryToken:         registryToken,
+		RegistryInsecure:      registryInsecure,
 		DiscoveryIntervalMs:   discoveryInterval,
 	}, nil
+}
+
+// parseTruthy treats the conventional shell-truthy strings as true.
+// Anything else (including empty) is false. Case-insensitive.
+func parseTruthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func splitTrim(s string) []string {

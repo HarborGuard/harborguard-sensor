@@ -55,12 +55,17 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 			Username:            cfg.RegistryUsername,
 			Token:               cfg.RegistryToken,
 			DiscoveryIntervalMs: cfg.DiscoveryIntervalMs,
+			Insecure:            cfg.RegistryInsecure,
 		})
 		if discErr != nil {
 			fmt.Fprintf(os.Stderr, "[agent] Registry discoverer initialization failed: %s\n", discErr.Error())
 		} else {
-			fmt.Fprintf(os.Stderr, "[agent] Registry discovery enabled for %s (%s)\n",
-				cfg.RegistryURL, discoverer.ProviderName())
+			mode := "TLS verified"
+			if cfg.RegistryInsecure {
+				mode = "insecure (HTTP, TLS verification skipped)"
+			}
+			fmt.Fprintf(os.Stderr, "[agent] Registry discovery enabled for %s (%s, %s)\n",
+				cfg.RegistryURL, discoverer.ProviderName(), mode)
 		}
 	}
 
@@ -264,6 +269,17 @@ func processJob(ctx context.Context, client *AgentClient, orch *scanner.Orchestr
 	// ref even though the scan itself runs correctly.
 	imageRef, insecure, _ := scanner.NormalizeImageRef(scan.ImageRef)
 
+	// Propagate the sensor-level insecure flag (HG_REGISTRY_INSECURE) to
+	// the scan when the image targets that same registry. The dashboard
+	// signals insecure mode out-of-band via the env var rather than by
+	// embedding `http://` in every job's image ref, so without this fan-
+	// out scans against the sensor's discovered registry would still
+	// default to https/strict-TLS and fail.
+	if !insecure && orch.Config.RegistryInsecure && refHostMatches(imageRef, orch.Config.RegistryURL) {
+		fmt.Fprintf(os.Stderr, "[agent] Applying sensor-level insecure flag to scan of %s\n", imageRef)
+		insecure = true
+	}
+
 	fmt.Fprintf(os.Stderr, "[agent] Starting scan: %s\n", imageRef)
 
 	// Clean up report directory when job completes
@@ -407,6 +423,11 @@ func processPatchJob(ctx context.Context, client *AgentClient, p *patcher.Patche
 			patch.Source.Insecure = true
 		}
 	}
+	// Sensor-level insecure flag fan-out (see processJob comment).
+	if !patch.Source.Insecure && p.Config != nil && p.Config.RegistryInsecure && refHostMatches(patch.Source.Ref, p.Config.RegistryURL) {
+		fmt.Fprintf(os.Stderr, "[agent] Applying sensor-level insecure flag to patch source %s\n", patch.Source.Ref)
+		patch.Source.Insecure = true
+	}
 	if patch.Sink.Kind == "registry" && patch.Sink.Registry != nil {
 		spec := *patch.Sink.Registry
 		if normalized, insecure, _ := scanner.NormalizeImageRef(spec.Ref); normalized != spec.Ref {
@@ -414,6 +435,11 @@ func processPatchJob(ctx context.Context, client *AgentClient, p *patcher.Patche
 			if insecure {
 				spec.Insecure = true
 			}
+			patch.Sink.Registry = &spec
+		}
+		if !spec.Insecure && p.Config != nil && p.Config.RegistryInsecure && refHostMatches(spec.Ref, p.Config.RegistryURL) {
+			fmt.Fprintf(os.Stderr, "[agent] Applying sensor-level insecure flag to patch sink %s\n", spec.Ref)
+			spec.Insecure = true
 			patch.Sink.Registry = &spec
 		}
 	}
@@ -458,6 +484,41 @@ func processPatchJob(ctx context.Context, client *AgentClient, p *patcher.Patche
 		fmt.Fprintf(os.Stderr, "[agent] Patch status report (%s) did not reach dashboard: %s\n", status, err.Error())
 	}
 	fmt.Fprintf(os.Stderr, "[agent] Patch %s: %s -> %s\n", status, patch.Source.Ref, envelope.Sink.Location)
+}
+
+// refHostMatches reports whether the host portion of an image reference
+// matches the host portion of the sensor's configured registry URL.
+// Both inputs may carry a scheme, port, or trailing path; only the
+// host[:port] portion is compared, case-insensitively.
+//
+// Used by processJob/processPatchJob to decide whether to fan the
+// sensor-level insecure flag (HG_REGISTRY_INSECURE) onto a per-job
+// ImageSource. The comparison is strict — a job whose ref is for some
+// other registry won't inherit insecure mode. The empty-string guard
+// only catches inputs that are themselves empty; bare Docker Hub refs
+// like "alpine:3.18" stringify to themselves through refHost and will
+// only ever match a misconfigured RegistryURL identical to that string.
+func refHostMatches(imageRef, registryURL string) bool {
+	a := refHost(imageRef)
+	if a == "" || registryURL == "" {
+		return false
+	}
+	return strings.EqualFold(a, refHost(registryURL))
+}
+
+// refHost extracts the host[:port] portion of a string by stripping
+// scheme and any trailing path. Inputs without a `/` are returned as-is
+// minus scheme — callers should treat the result as opaque and rely on
+// equality (via refHostMatches) rather than interpreting it as a host
+// in isolation.
+func refHost(s string) string {
+	if idx := strings.Index(s, "://"); idx != -1 {
+		s = s[idx+3:]
+	}
+	if idx := strings.Index(s, "/"); idx != -1 {
+		s = s[:idx]
+	}
+	return strings.TrimRight(s, "/")
 }
 
 // resolveSensorRegistryCreds pulls out the sensor-level registry credentials
