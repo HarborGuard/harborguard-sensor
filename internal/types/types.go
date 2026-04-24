@@ -47,11 +47,19 @@ type CatalogReport struct {
 }
 
 // ImageSource represents the source of a container image to scan.
+//
+// Insecure is set by the orchestrator when the caller supplies an
+// http://-scheme ref, and tells per-scanner command builders to emit
+// TLS-skip flags (trivy --insecure, grype/syft GRYPE_REGISTRY_INSECURE_*
+// env, skopeo --src-tls-verify=false) rather than letting the scheme
+// reach a scanner's image-reference parser — which universally rejects
+// it.
 type ImageSource struct {
-	Type  string `json:"type"` // "docker", "registry", "tar", "s3"
-	Ref   string `json:"ref,omitempty"`
-	Path  string `json:"path,omitempty"`
-	S3Key string `json:"s3Key,omitempty"`
+	Type     string `json:"type"` // "docker", "registry", "tar", "s3"
+	Ref      string `json:"ref,omitempty"`
+	Path     string `json:"path,omitempty"`
+	S3Key    string `json:"s3Key,omitempty"`
+	Insecure bool   `json:"insecure,omitempty"`
 }
 
 // ScannerResult holds the output of a single scanner run.

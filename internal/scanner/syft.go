@@ -27,7 +27,12 @@ func (s *SyftScanner) Scan(ctx context.Context, source types.ImageSource, output
 	if cacheDir == "" {
 		cacheDir = "/workspace/cache/syft"
 	}
-	env := BuildEnv(map[string]string{"SYFT_CACHE_DIR": cacheDir})
+	envExtras := map[string]string{"SYFT_CACHE_DIR": cacheDir}
+	if source.Insecure && source.Type == "registry" {
+		envExtras["SYFT_REGISTRY_INSECURE_SKIP_TLS_VERIFY"] = "true"
+		envExtras["SYFT_REGISTRY_INSECURE_USE_HTTP"] = "true"
+	}
+	env := BuildEnv(envExtras)
 
 	// Main JSON output (retry once on transient failure)
 	cmd := fmt.Sprintf(`syft %s -o json > "%s"`, ref, outputPath)

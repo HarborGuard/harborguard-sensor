@@ -24,6 +24,24 @@ type Orchestrator struct {
 // Execute runs all configured scanners for the given job.
 // The provided context allows cancellation of in-flight scans.
 func (o *Orchestrator) Execute(ctx context.Context, job types.ScanJob) (*types.ScanOutput, error) {
+	// Dashboards occasionally embed a URL scheme in the image reference
+	// (e.g. `http://host:5000/repo:tag`). Trivy, grype, skopeo and every
+	// other tool we invoke parse this with go-containerregistry, which
+	// rejects scheme-prefixed refs outright. Strip the scheme once here,
+	// remember whether it was http (insecure), and let per-scanner command
+	// builders emit the appropriate TLS-skip flag downstream. ScanJob is
+	// passed by value so these mutations stay local.
+	if normalized, insecure, changed := NormalizeImageRef(job.Source.Ref); changed {
+		job.Source.Ref = normalized
+		if insecure {
+			job.Source.Insecure = true
+		}
+		fmt.Fprintf(os.Stderr, "[orchestrator] Stripped scheme from source ref: insecure=%t\n", job.Source.Insecure)
+	}
+	if normalized, _, changed := NormalizeImageRef(job.ImageRef); changed {
+		job.ImageRef = normalized
+	}
+
 	startedAt := time.Now().UTC().Format(time.RFC3339)
 	outputDir := filepath.Join(o.Config.WorkDir, "reports", job.ID)
 	if err := os.MkdirAll(outputDir, 0700); err != nil {
@@ -275,13 +293,17 @@ func (o *Orchestrator) prefetchRegistryImage(ctx context.Context, source types.I
 	// argument avoids a /bin/sh -c expansion layer that has caused
 	// hard-to-debug "invalid credentials" rejections on ECR.
 	args := []string{"copy"}
+	if source.Insecure {
+		args = append(args, "--src-tls-verify=false")
+	}
 	user, pass, credSource := resolveRegistryCredsSource(o.RegistryCreds)
 	if user != "" {
 		args = append(args, "--src-creds", user+":"+pass)
-		fmt.Fprintf(os.Stderr, "[orchestrator] Prefetch auth: user=%s source=%s (pass=%d chars)\n",
-			user, credSource, len(pass))
+		fmt.Fprintf(os.Stderr, "[orchestrator] Prefetch auth: user=%s source=%s (pass=%d chars) insecure=%t\n",
+			user, credSource, len(pass), source.Insecure)
 	} else {
-		fmt.Fprintf(os.Stderr, "[orchestrator] Prefetch auth: anonymous (no credentials in RegistryCreds/REGISTRY_USER/TRIVY_USERNAME)\n")
+		fmt.Fprintf(os.Stderr, "[orchestrator] Prefetch auth: anonymous (no credentials in RegistryCreds/REGISTRY_USER/TRIVY_USERNAME) insecure=%t\n",
+			source.Insecure)
 	}
 	args = append(args, "docker://"+ref, "docker-archive:"+tarPath)
 
@@ -434,6 +456,27 @@ func describeDataShape(data interface{}) string {
 		return fmt.Sprintf("array(%d elements)", len(v))
 	default:
 		return fmt.Sprintf("%T", v)
+	}
+}
+
+// NormalizeImageRef strips a URL scheme from an image reference and reports
+// whether the scheme was http (insecure). Scanners and skopeo all reject
+// scheme-prefixed refs; the boolean drives per-tool TLS-skip flags.
+//
+// Returns the normalized ref, whether it was http (insecure), and whether
+// anything was actually trimmed — callers use the third value to avoid
+// emitting noisy "stripped scheme" log lines when nothing changed.
+// Exported so callers upstream of Execute (agent loop, cmd) can normalize
+// once at the boundary rather than only inside the orchestrator, which
+// keeps the scheme out of the envelope displayed on the dashboard.
+func NormalizeImageRef(ref string) (string, bool, bool) {
+	switch {
+	case strings.HasPrefix(ref, "http://"):
+		return strings.TrimPrefix(ref, "http://"), true, true
+	case strings.HasPrefix(ref, "https://"):
+		return strings.TrimPrefix(ref, "https://"), false, true
+	default:
+		return ref, false, false
 	}
 }
 

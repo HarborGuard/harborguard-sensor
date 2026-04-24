@@ -35,7 +35,14 @@ func (o *OsvScanner) Scan(ctx context.Context, source types.ImageSource, outputP
 		// Generate independent SBOM
 		ref := FormatSourceRef(source.Type, source.Ref, source.Path)
 		cmd := fmt.Sprintf(`syft %s -o cyclonedx-json@1.5 > "%s"`, ref, ownSbom)
-		_, _, err := ExecWithTimeout(ctx, cmd, osvTimeoutMs, nil)
+		var sbomEnv []string
+		if source.Insecure && source.Type == "registry" {
+			sbomEnv = BuildEnv(map[string]string{
+				"SYFT_REGISTRY_INSECURE_SKIP_TLS_VERIFY": "true",
+				"SYFT_REGISTRY_INSECURE_USE_HTTP":        "true",
+			})
+		}
+		_, _, err := ExecWithTimeout(ctx, cmd, osvTimeoutMs, sbomEnv)
 		if err != nil {
 			msg := err.Error()
 			if ctx.Err() != nil {

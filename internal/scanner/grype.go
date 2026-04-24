@@ -24,7 +24,12 @@ func (g *GrypeScanner) Scan(ctx context.Context, source types.ImageSource, outpu
 	if cacheDir == "" {
 		cacheDir = "/workspace/cache/grype"
 	}
-	env := BuildEnv(map[string]string{"GRYPE_DB_CACHE_DIR": cacheDir})
+	envExtras := map[string]string{"GRYPE_DB_CACHE_DIR": cacheDir}
+	if source.Insecure && source.Type == "registry" {
+		envExtras["GRYPE_REGISTRY_INSECURE_SKIP_TLS_VERIFY"] = "true"
+		envExtras["GRYPE_REGISTRY_INSECURE_USE_HTTP"] = "true"
+	}
+	env := BuildEnv(envExtras)
 
 	_, _, err := ExecWithTimeout(ctx, cmd, grypeTimeoutMs, env)
 	durationMs := time.Since(start).Milliseconds()

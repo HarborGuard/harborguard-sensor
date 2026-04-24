@@ -54,12 +54,23 @@ func runScan(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Strip any URL scheme from the ref for ref-bearing source types so
+	// the envelope, logs, and downstream scanners all see a clean
+	// `host:port/repo:tag`. For `tar`/`s3` the positional arg is a path
+	// or object key, not a ref, so leave it alone.
+	var insecure bool
+	if sourceType == "registry" || sourceType == "docker" {
+		var normalized string
+		normalized, insecure, _ = scanner.NormalizeImageRef(image)
+		image = normalized
+	}
+
 	var source types.ImageSource
 	switch sourceType {
 	case "tar":
 		source = types.ImageSource{Type: "tar", Path: image}
 	case "registry":
-		source = types.ImageSource{Type: "registry", Ref: image}
+		source = types.ImageSource{Type: "registry", Ref: image, Insecure: insecure}
 	case "s3":
 		key := s3Key
 		if key == "" {
@@ -67,7 +78,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 		}
 		source = types.ImageSource{Type: "s3", Ref: image, S3Key: key}
 	default:
-		source = types.ImageSource{Type: "docker", Ref: image}
+		source = types.ImageSource{Type: "docker", Ref: image, Insecure: insecure}
 	}
 
 	scanID := uuid.New().String()

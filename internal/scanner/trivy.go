@@ -47,6 +47,9 @@ func (t *TrivyScanner) Scan(ctx context.Context, source types.ImageSource, outpu
 
 func (t *TrivyScanner) buildCommand(source types.ImageSource, outputPath string) string {
 	base := fmt.Sprintf(`trivy image -f json -o "%s"`, outputPath)
+	if source.Insecure && source.Type == "registry" {
+		base += " --insecure"
+	}
 	switch source.Type {
 	case "tar":
 		return fmt.Sprintf(`%s --input "%s"`, base, source.Path)

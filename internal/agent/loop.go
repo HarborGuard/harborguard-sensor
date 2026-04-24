@@ -253,7 +253,18 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 
 func processJob(ctx context.Context, client *AgentClient, orch *scanner.Orchestrator, s3store *storage.S3Storage, job types.AgentJob, discoverer *registry.Discoverer) {
 	scan := job.Scan
-	fmt.Fprintf(os.Stderr, "[agent] Starting scan: %s\n", scan.ImageRef)
+
+	// Normalize once at the boundary so the envelope uploaded to the
+	// dashboard — as well as every log line — shows a clean
+	// `host:port/repo:tag` ref rather than the dashboard's raw
+	// `http://host:port/repo:tag`. The orchestrator still normalizes
+	// defensively, but doing it here threads the normalized ref through
+	// BuildEnvelope (which reads ImageRef directly into Image.Ref / name
+	// / tag). Without this the UI card keeps showing the scheme-prefixed
+	// ref even though the scan itself runs correctly.
+	imageRef, insecure, _ := scanner.NormalizeImageRef(scan.ImageRef)
+
+	fmt.Fprintf(os.Stderr, "[agent] Starting scan: %s\n", imageRef)
 
 	// Clean up report directory when job completes
 	reportDir := filepath.Join(orch.Config.WorkDir, "reports", job.ID)
@@ -271,9 +282,13 @@ func processJob(ctx context.Context, client *AgentClient, orch *scanner.Orchestr
 	}()
 
 	source := resolveImageSource(scan)
+	source.Ref = imageRef
+	if insecure {
+		source.Insecure = true
+	}
 	output, err := orch.Execute(ctx, types.ScanJob{
 		ID:       job.ID,
-		ImageRef: scan.ImageRef,
+		ImageRef: imageRef,
 		Source:   source,
 		Scanners: scan.Scanners,
 	})
@@ -286,13 +301,13 @@ func processJob(ctx context.Context, client *AgentClient, orch *scanner.Orchestr
 
 	// If cancelled, report status and skip uploads
 	if output.Cancelled {
-		fmt.Fprintf(os.Stderr, "[agent] Scan cancelled: %s\n", scan.ImageRef)
+		fmt.Fprintf(os.Stderr, "[agent] Scan cancelled: %s\n", imageRef)
 		_ = client.ReportJobStatus(job.ID, "cancelled", "")
 		return
 	}
 
 	envelope := adapter.BuildEnvelope(
-		types.ScanJob{ID: job.ID, ImageRef: scan.ImageRef, Source: source},
+		types.ScanJob{ID: job.ID, ImageRef: imageRef, Source: source},
 		output,
 	)
 
@@ -324,17 +339,53 @@ func processJob(ctx context.Context, client *AgentClient, orch *scanner.Orchestr
 		_, _ = s3store.UploadScanResults(job.ID, envelope)
 	}
 
-	// Push results to dashboard
+	// Push results to dashboard. Upload the envelope even when every
+	// scanner failed so operators can see the per-scanner error messages
+	// on the dashboard — but flag the job as failed, not completed,
+	// below. Without this the dashboard previously displayed "COMPLETED
+	// with 0 findings" for scans where no scanner actually ran.
 	if _, _, err := client.UploadResults(envelope); err != nil {
 		fmt.Fprintf(os.Stderr, "[agent] Upload failed: %s\n", err.Error())
 		_ = client.ReportJobStatus(job.ID, "failed", err.Error())
 		return
 	}
 
+	if failureMsg := summarizeScannerFailures(output.Results); failureMsg != "" {
+		fmt.Fprintf(os.Stderr, "[agent] All scanners failed for %s: %s\n", imageRef, failureMsg)
+		if err := client.ReportJobStatus(job.ID, "failed", failureMsg); err != nil {
+			fmt.Fprintf(os.Stderr, "[agent] Status report failed: %s\n", err.Error())
+		}
+		return
+	}
+
 	if err := client.ReportJobStatus(job.ID, "completed", ""); err != nil {
 		fmt.Fprintf(os.Stderr, "[agent] Status report failed: %s\n", err.Error())
 	}
-	fmt.Fprintf(os.Stderr, "[agent] Scan complete: %s\n", scan.ImageRef)
+	fmt.Fprintf(os.Stderr, "[agent] Scan complete: %s\n", imageRef)
+}
+
+// summarizeScannerFailures returns an error message suitable for reporting
+// `failed` status when every scanner in the run failed. Returns "" when at
+// least one scanner succeeded — the job is then reported as `completed`
+// with PARTIAL envelope status supplying per-scanner detail.
+func summarizeScannerFailures(results map[string]*types.ScannerResult) string {
+	if len(results) == 0 {
+		return "no scanners produced results"
+	}
+	var failed []string
+	for name, r := range results {
+		if r == nil || !r.Success {
+			msg := "unknown error"
+			if r != nil && r.Error != "" {
+				msg = r.Error
+			}
+			failed = append(failed, name+": "+msg)
+		}
+	}
+	if len(failed) != len(results) {
+		return "" // at least one succeeded — treat as completed/partial
+	}
+	return "all scanners failed (" + strings.Join(failed, "; ") + ")"
 }
 
 func processPatchJob(ctx context.Context, client *AgentClient, p *patcher.Patcher, job types.AgentJob) {
