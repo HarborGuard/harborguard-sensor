@@ -244,6 +244,20 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 					delete(cancelMap, job.ID)
 					cancelMu.Unlock()
 					jobCancel()
+
+				default:
+					// Without this, an unknown type or a job whose typed
+					// payload failed to decode (e.g. type="patch" but
+					// Patch=nil) would be consumed from the poll response
+					// and silently dropped. The dashboard would then wait
+					// forever for a callback the sensor never intends to
+					// make — surfacing as "machine exited but results were
+					// not received via callback" on the supervisor side.
+					msg := fmt.Sprintf("unhandled job type=%q (scan=%t, patch=%t)", job.Type, job.Scan != nil, job.Patch != nil)
+					fmt.Fprintf(os.Stderr, "[agent] Dropping job %s: %s\n", job.ID, msg)
+					if reportErr := client.ReportJobStatus(job.ID, "failed", msg); reportErr != nil {
+						fmt.Fprintf(os.Stderr, "[agent] Status report (failed) did not reach dashboard: %s\n", reportErr.Error())
+					}
 				}
 			}
 		}
