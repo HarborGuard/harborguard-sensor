@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -220,11 +221,39 @@ func runBuildahCmd(ctx context.Context, args, env []string, logOut *os.File, cap
 	} else {
 		cmd.Stdout = logOut
 	}
-	cmd.Stderr = logOut
+	// Tee stderr to the log file and to an in-memory buffer so we can surface
+	// the underlying message (e.g. apt-get's "Unable to locate package …")
+	// in the returned error instead of just "exit status N".
+	var stderr strings.Builder
+	if logOut != nil {
+		cmd.Stderr = io.MultiWriter(logOut, &stderr)
+	} else {
+		cmd.Stderr = &stderr
+	}
 	if err := cmd.Run(); err != nil {
-		return stdout.String(), fmt.Errorf("buildah %s: %w", args[0], err)
+		return stdout.String(), fmt.Errorf("buildah %s: %w: %s", subcommandLabel(args), err, truncateErr(stderr.String()))
 	}
 	return stdout.String(), nil
+}
+
+// subcommandLabel returns the buildah subcommand portion of args, skipping
+// leading global flags like "--storage-driver <driver>" so error messages
+// read "buildah run: …" instead of "buildah --storage-driver: …".
+func subcommandLabel(args []string) string {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "--") {
+			if eq := strings.IndexByte(a, '='); eq == -1 && i+1 < len(args) {
+				i++ // skip the flag's value
+			}
+			continue
+		}
+		return a
+	}
+	if len(args) > 0 {
+		return args[0]
+	}
+	return "?"
 }
 
 func storageFlags(driver string) []string {
