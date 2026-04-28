@@ -307,31 +307,40 @@ func installCommand(pm string, pkg types.PatchPackage) (string, error) {
 	if pkg.Name == "" {
 		return "", fmt.Errorf("package name required")
 	}
+	// When TargetVersion is set, prefer the exact pin but fall back to
+	// "upgrade to whatever the repo currently offers" if the pinned version
+	// has rolled out of the security archive (e.g. Debian's
+	// security.debian.org only keeps the latest +deb*uN of each package).
+	// Forward-only archives guarantee the fallback installs >= the requested
+	// fix, so no version compare is needed.
+	name := shellQuote(pkg.Name)
 	switch pm {
 	case "apt":
 		if pkg.TargetVersion == "" {
-			return fmt.Sprintf("apt-get install -y --no-install-recommends %s", shellQuote(pkg.Name)), nil
+			return fmt.Sprintf("apt-get install -y --no-install-recommends %s", name), nil
 		}
-		return fmt.Sprintf("apt-get install -y --no-install-recommends %s=%s",
-			shellQuote(pkg.Name), shellQuote(pkg.TargetVersion)), nil
+		return fmt.Sprintf(
+			"apt-get install -y --no-install-recommends %s=%s "+
+				"|| apt-get install -y --no-install-recommends --only-upgrade %s",
+			name, shellQuote(pkg.TargetVersion), name), nil
 	case "apk":
 		if pkg.TargetVersion == "" {
-			return fmt.Sprintf("apk add --no-cache %s", shellQuote(pkg.Name)), nil
+			return fmt.Sprintf("apk add --no-cache %s", name), nil
 		}
-		return fmt.Sprintf("apk add --no-cache %s=%s",
-			shellQuote(pkg.Name), shellQuote(pkg.TargetVersion)), nil
+		return fmt.Sprintf("apk add --no-cache %s=%s || apk upgrade --no-cache %s",
+			name, shellQuote(pkg.TargetVersion), name), nil
 	case "yum":
 		if pkg.TargetVersion == "" {
-			return fmt.Sprintf("yum install -y %s", shellQuote(pkg.Name)), nil
+			return fmt.Sprintf("yum install -y %s", name), nil
 		}
-		return fmt.Sprintf("yum install -y %s-%s",
-			shellQuote(pkg.Name), shellQuote(pkg.TargetVersion)), nil
+		return fmt.Sprintf("yum install -y %s-%s || yum update -y %s",
+			name, shellQuote(pkg.TargetVersion), name), nil
 	case "dnf":
 		if pkg.TargetVersion == "" {
-			return fmt.Sprintf("dnf install -y %s", shellQuote(pkg.Name)), nil
+			return fmt.Sprintf("dnf install -y %s", name), nil
 		}
-		return fmt.Sprintf("dnf install -y %s-%s",
-			shellQuote(pkg.Name), shellQuote(pkg.TargetVersion)), nil
+		return fmt.Sprintf("dnf install -y %s-%s || dnf upgrade -y %s",
+			name, shellQuote(pkg.TargetVersion), name), nil
 	case "":
 		return "", fmt.Errorf("could not determine package manager (supply PackageManager or StrategyHint)")
 	default:
