@@ -19,7 +19,7 @@ ARG DIVE_VERSION=0.13.1
 # buildah + fuse-overlayfs enable optional image patching. Whether patching
 # is actually usable at runtime is decided by capability probe (buildah on
 # PATH; storage driver auto-selects overlay when /dev/fuse is present, else vfs).
-RUN apk add --no-cache curl bash ca-certificates skopeo buildah netavark fuse-overlayfs \
+RUN apk add --no-cache curl bash ca-certificates skopeo buildah netavark fuse-overlayfs tini \
   && set -eux \
   && echo "Building for architecture: ${TARGETARCH:-not set}" \
   && TARGETARCH="${TARGETARCH:-amd64}" \
@@ -82,5 +82,7 @@ ENV SYFT_CACHE_DIR=/workspace/cache/syft
 # Pre-bake scanner databases so containers start without cold-start downloads
 RUN trivy image --download-db-only && grype db update
 
-ENTRYPOINT ["harborguard-sensor"]
+# tini reaps zombies (e.g. fuse-overlayfs daemons reparented to PID 1
+# when buildah exits) and forwards signals to the sensor.
+ENTRYPOINT ["/sbin/tini", "--", "harborguard-sensor"]
 CMD ["agent"]
