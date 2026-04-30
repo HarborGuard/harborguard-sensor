@@ -290,11 +290,12 @@ type AgentHeartbeat struct {
 
 // AgentJob represents a job received from the dashboard.
 type AgentJob struct {
-	ID        string         `json:"id"`
-	Type      string         `json:"type"` // scan, SCAN, patch, PATCH
-	CreatedAt string         `json:"createdAt"`
-	Scan      *AgentJobScan  `json:"scan,omitempty"`
-	Patch     *AgentJobPatch `json:"patch,omitempty"`
+	ID        string          `json:"id"`
+	Type      string          `json:"type"` // scan, SCAN, patch, PATCH, export, EXPORT
+	CreatedAt string          `json:"createdAt"`
+	Scan      *AgentJobScan   `json:"scan,omitempty"`
+	Patch     *AgentJobPatch  `json:"patch,omitempty"`
+	Export    *AgentJobExport `json:"export,omitempty"`
 }
 
 type AgentJobScan struct {
@@ -417,7 +418,80 @@ const (
 	CapScan      = "scan"
 	CapDiscovery = "discovery"
 	CapPatch     = "patch"
+	CapExport    = "export"
 )
+
+// AgentJobExport describes a job to package the source image as a tarball
+// and ship it to S3 (using the sensor's configured S3 storage).
+//
+// The sensor pulls the image to a docker-archive via skopeo, optionally
+// gzips it, and PUTs the resulting object under sink.KeyPrefix. When
+// sink.Presign is set, a time-limited GET URL is returned in the
+// envelope so the dashboard can hand the artifact off without proxying
+// multi-GB bytes through its own request path.
+type AgentJobExport struct {
+	Source            ImageSource          `json:"source"`
+	SourceCredentials *RegistryCredentials `json:"sourceCredentials,omitempty"`
+	Sink              ExportSink           `json:"sink"`
+	// Compress: when true, gzip the tarball before upload. Image layers
+	// inside a docker-archive are already gzipped, so a second pass
+	// typically saves <5% at meaningful CPU cost — left off by default.
+	Compress bool `json:"compress,omitempty"`
+}
+
+// ExportSink describes the S3 destination for an export job. Bucket and
+// KeyPrefix are optional; bucket defaults to the sensor's configured
+// bucket and KeyPrefix to "exports/<jobID>/".
+type ExportSink struct {
+	Bucket    string `json:"bucket,omitempty"`
+	KeyPrefix string `json:"keyPrefix,omitempty"`
+	Presign   bool   `json:"presign,omitempty"`
+	TTLSecs   int    `json:"ttlSecs,omitempty"` // default 3600 if Presign && unset
+}
+
+// ExportJob is the internal sensor-side representation (parallels PatchJob).
+type ExportJob struct {
+	ID  string         `json:"id"`
+	Job AgentJobExport `json:"job"`
+}
+
+// ExportEnvelope is the top-level JSON uploaded to the dashboard after an export.
+type ExportEnvelope struct {
+	Version string             `json:"version"`
+	Sensor  EnvelopeSensor     `json:"sensor"`
+	Source  EnvelopeImage      `json:"source"`
+	Export  EnvelopeExport     `json:"export"`
+	Sink    EnvelopeExportSink `json:"sink"`
+	Tooling map[string]string  `json:"tooling"`
+}
+
+type EnvelopeExport struct {
+	ID         string `json:"id"`
+	StartedAt  string `json:"startedAt"`
+	FinishedAt string `json:"finishedAt"`
+	// Status is always "SUCCESS" — failures don't produce an envelope
+	// (the sensor reports failed/cancelled via ReportJobStatus instead),
+	// unlike PatchEnvelope where partial-package-failure is meaningful
+	// metadata to keep around.
+	Status string `json:"status"`
+}
+
+// EnvelopeExportSink reports where the sensor shipped the tarball.
+//
+// Sha256 is computed over the bytes that landed in S3 — i.e. the gzipped
+// payload when Compressed=true, the raw docker-archive otherwise. This
+// lets a downloader verify integrity by hashing the object they fetched
+// without having to decompress first. SizeBytes follows the same rule:
+// it's the on-disk size of the uploaded object, not the original tar.
+type EnvelopeExportSink struct {
+	Kind       string `json:"kind"` // "s3"
+	Bucket     string `json:"bucket,omitempty"`
+	Key        string `json:"key"`
+	URL        string `json:"url,omitempty"` // presigned GET URL, when requested
+	SizeBytes  int64  `json:"sizeBytes"`
+	Sha256     string `json:"sha256,omitempty"`
+	Compressed bool   `json:"compressed,omitempty"`
+}
 
 // PollResponse wraps the dashboard poll response to include cancel signals.
 type PollResponse struct {

@@ -137,6 +137,19 @@ func (c *AgentClient) UploadPatchResult(envelope *types.PatchEnvelope) (string, 
 	return result.PatchID, nil
 }
 
+// UploadExportResult uploads the export envelope to the dashboard. The
+// envelope is small (metadata only — the tarball itself is in S3); a
+// reasonable rule of thumb is that it shouldn't exceed a few KB.
+func (c *AgentClient) UploadExportResult(envelope *types.ExportEnvelope) (string, error) {
+	var result struct {
+		ExportID string `json:"exportId"`
+	}
+	if err := c.request("POST", "/api/exports/upload", envelope, &result); err != nil {
+		return "", err
+	}
+	return result.ExportID, nil
+}
+
 // ReportCatalog sends the discovered registry catalog to the dashboard.
 func (c *AgentClient) ReportCatalog(catalog types.CatalogReport) error {
 	return c.request("POST", "/api/agent/catalog", catalog, nil)

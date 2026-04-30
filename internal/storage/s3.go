@@ -3,6 +3,8 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,10 +13,21 @@ import (
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	hgtypes "github.com/HarborGuard/harborguard-sensor/internal/types"
+)
+
+// Multipart upload tuning. PartSize=10MB is mid-range of the dashboard
+// reviewer's 8–16MB recommendation and balances S3 part-count limits
+// (10k parts) against memory pressure (PartSize * Concurrency in flight).
+// Concurrency=4 saturates a typical 1Gbps egress without thrashing the
+// SDK's internal buffer pool.
+const (
+	uploadPartSize    = 10 * 1024 * 1024
+	uploadConcurrency = 4
 )
 
 // S3Storage handles uploads and downloads to S3/MinIO.
@@ -84,6 +97,95 @@ func (s *S3Storage) UploadSbom(scanID string, data interface{}) (string, error) 
 		return "", err
 	}
 	return key, s.putObject(key, b, "application/json")
+}
+
+// UploadArtifactStream uploads a file from disk to S3 (optionally to an
+// override bucket) and returns the size in bytes plus the SHA-256 of the
+// bytes uploaded. When bucket is empty, the storage's default bucket is
+// used.
+//
+// Uses the SDK's multipart Uploader so files larger than the 5 GB
+// single-PUT cap upload successfully — image tarballs routinely cross
+// that line. The Uploader picks single-PUT under PartSize and switches
+// to multipart automatically.
+//
+// Hash is computed in a separate pre-pass rather than via a TeeReader
+// during upload. The earlier TeeReader shape was wrong under SDK
+// retries: the AWS SDK rewinds Body via Seek to retry signed requests,
+// but a TeeReader is not seekable, and the captured hasher would not
+// reset between attempts. With multipart upload the retry surface is
+// even larger (each part can retry independently), so pre-hashing is
+// the only correctness-preserving option. Two reads of the same file
+// are cheap (the second hits the OS page cache after the first).
+func (s *S3Storage) UploadArtifactStream(ctx context.Context, bucket, key, filePath, contentType string) (int64, string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return 0, "", err
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return 0, "", err
+	}
+	size := stat.Size()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return 0, "", fmt.Errorf("hashing source: %w", err)
+	}
+	sha := hex.EncodeToString(hasher.Sum(nil))
+
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, "", fmt.Errorf("rewinding source: %w", err)
+	}
+
+	dest := s.bucket
+	if bucket != "" {
+		dest = bucket
+	}
+
+	uploader := manager.NewUploader(s.client, func(u *manager.Uploader) {
+		u.PartSize = uploadPartSize
+		u.Concurrency = uploadConcurrency
+	})
+
+	input := &s3.PutObjectInput{
+		Bucket: &dest,
+		Key:    &key,
+		Body:   f,
+	}
+	if contentType != "" {
+		input.ContentType = &contentType
+	}
+
+	if _, err := uploader.Upload(ctx, input); err != nil {
+		return 0, "", err
+	}
+	return size, sha, nil
+}
+
+// PresignGetForBucket is a bucket-aware variant of GetPresignedURL. When
+// bucket is empty, the storage's default bucket is used. Used by the
+// exporter so a job can target a non-default bucket and still receive a
+// presigned URL pointing at it.
+func (s *S3Storage) PresignGetForBucket(bucket, key string, expiresIn time.Duration) (string, error) {
+	dest := s.bucket
+	if bucket != "" {
+		dest = bucket
+	}
+	presigner := s3.NewPresignClient(s.client)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req, err := presigner.PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: &dest,
+		Key:    &key,
+	}, s3.WithPresignExpires(expiresIn))
+	if err != nil {
+		return "", err
+	}
+	return req.URL, nil
 }
 
 // UploadArtifact uploads a file from disk to an arbitrary S3 key.

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/HarborGuard/harborguard-sensor/internal/adapter"
+	"github.com/HarborGuard/harborguard-sensor/internal/exporter"
 	"github.com/HarborGuard/harborguard-sensor/internal/patcher"
 	"github.com/HarborGuard/harborguard-sensor/internal/registry"
 	"github.com/HarborGuard/harborguard-sensor/internal/scanner"
@@ -82,6 +83,11 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 		capabilities = append(capabilities, types.CapDiscovery)
 	}
 
+	// Resolve sensor-level registry creds once. Shared by patcher and
+	// exporter so we don't double-hit the discoverer (e.g. ECR token
+	// fetch) at startup.
+	sensorCreds := resolveSensorRegistryCreds(ctx, discoverer)
+
 	// Patch capability probe. The sensor shells out to buildah per job; no
 	// long-lived helper daemon to supervise. When probe fails the sensor
 	// registers without "patch" and the dashboard will never dispatch patch
@@ -90,7 +96,6 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 	if canPatch, reason := patcher.Probe(); canPatch {
 		fmt.Fprintf(os.Stderr, "[agent] %s\n", reason)
 		capabilities = append(capabilities, types.CapPatch)
-		sensorCreds := resolveSensorRegistryCreds(ctx, discoverer)
 		patcherInstance = &patcher.Patcher{
 			Config:              cfg,
 			S3Storage:           s3store,
@@ -98,6 +103,24 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 		}
 	} else {
 		fmt.Fprintf(os.Stderr, "[agent] patch capability disabled: %s\n", reason)
+	}
+
+	// Export capability requires S3 storage to be configured — the
+	// tarball lands in S3 and the dashboard receives a metadata envelope
+	// (optionally with a presigned GET URL). When S3 is missing we skip
+	// the capability so the dashboard never dispatches an export the
+	// sensor can't fulfill.
+	var exporterInstance *exporter.Exporter
+	if s3store != nil {
+		capabilities = append(capabilities, types.CapExport)
+		exporterInstance = &exporter.Exporter{
+			Config:              cfg,
+			S3Storage:           s3store,
+			SensorRegistryCreds: sensorCreds,
+		}
+		fmt.Fprintln(os.Stderr, "[agent] export capability enabled")
+	} else {
+		fmt.Fprintln(os.Stderr, "[agent] export capability disabled: sensor S3 storage is not configured")
 	}
 
 	agentID, err := registerWithRetry(client, types.AgentRegistration{
@@ -245,6 +268,27 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 					cancelMu.Unlock()
 					jobCancel()
 
+				case jobType == "export" && job.Export != nil:
+					if exporterInstance == nil {
+						msg := "export job received but sensor has no S3 storage configured"
+						fmt.Fprintf(os.Stderr, "[agent] %s (job=%s)\n", msg, job.ID)
+						_ = client.ReportJobStatus(job.ID, "failed", msg)
+						continue
+					}
+					jobCtx, jobCancel := context.WithCancel(ctx)
+					cancelMu.Lock()
+					cancelMap[job.ID] = jobCancel
+					cancelMu.Unlock()
+
+					activeJobs++
+					processExportJob(jobCtx, client, exporterInstance, job)
+					activeJobs--
+
+					cancelMu.Lock()
+					delete(cancelMap, job.ID)
+					cancelMu.Unlock()
+					jobCancel()
+
 				default:
 					// Without this, an unknown type or a job whose typed
 					// payload failed to decode (e.g. type="patch" but
@@ -253,7 +297,8 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 					// forever for a callback the sensor never intends to
 					// make — surfacing as "machine exited but results were
 					// not received via callback" on the supervisor side.
-					msg := fmt.Sprintf("unhandled job type=%q (scan=%t, patch=%t)", job.Type, job.Scan != nil, job.Patch != nil)
+					msg := fmt.Sprintf("unhandled job type=%q (scan=%t, patch=%t, export=%t)",
+						job.Type, job.Scan != nil, job.Patch != nil, job.Export != nil)
 					fmt.Fprintf(os.Stderr, "[agent] Dropping job %s: %s\n", job.ID, msg)
 					if reportErr := client.ReportJobStatus(job.ID, "failed", msg); reportErr != nil {
 						fmt.Fprintf(os.Stderr, "[agent] Status report (failed) did not reach dashboard: %s\n", reportErr.Error())
@@ -498,6 +543,67 @@ func processPatchJob(ctx context.Context, client *AgentClient, p *patcher.Patche
 		fmt.Fprintf(os.Stderr, "[agent] Patch status report (%s) did not reach dashboard: %s\n", status, err.Error())
 	}
 	fmt.Fprintf(os.Stderr, "[agent] Patch %s: %s -> %s\n", status, patch.Source.Ref, envelope.Sink.Location)
+}
+
+func processExportJob(ctx context.Context, client *AgentClient, e *exporter.Exporter, job types.AgentJob) {
+	export := *job.Export // copy so mutations stay local
+
+	// Mirror the patch path's normalization: strip schemes, fan out the
+	// sensor-level insecure flag when the source targets the discovered
+	// registry. Without this an http:// dashboard ref reaches skopeo as
+	// "docker://http://..." and fails with "Invalid source name".
+	if normalized, insecure, _ := scanner.NormalizeImageRef(export.Source.Ref); normalized != export.Source.Ref {
+		export.Source.Ref = normalized
+		if insecure {
+			export.Source.Insecure = true
+		}
+	}
+	if !export.Source.Insecure && e.Config != nil && e.Config.RegistryInsecure && refHostMatches(export.Source.Ref, e.Config.RegistryURL) {
+		fmt.Fprintf(os.Stderr, "[agent] Applying sensor-level insecure flag to export source %s\n", export.Source.Ref)
+		export.Source.Insecure = true
+	}
+
+	fmt.Fprintf(os.Stderr, "[agent] Starting export: %s -> sink=s3 (compress=%t, presign=%t)\n",
+		export.Source.Ref, export.Compress, export.Sink.Presign)
+
+	envelope, err := e.Execute(ctx, types.ExportJob{
+		ID:  job.ID,
+		Job: export,
+	})
+	if err != nil {
+		// Cancellation: dashboard sent a cancel signal which fired
+		// jobCancel(); Execute returned with a context-canceled error
+		// somewhere in skopeo / S3. Report "cancelled" so the
+		// dashboard distinguishes user-initiated stops from real
+		// failures (matches the scan path's Cancelled handling).
+		if ctx.Err() != nil {
+			fmt.Fprintf(os.Stderr, "[agent] Export cancelled: %s\n", export.Source.Ref)
+			if reportErr := client.ReportJobStatus(job.ID, "cancelled", ""); reportErr != nil {
+				fmt.Fprintf(os.Stderr, "[agent] Export status report (cancelled) did not reach dashboard: %s\n", reportErr.Error())
+			}
+			return
+		}
+		msg := err.Error()
+		fmt.Fprintf(os.Stderr, "[agent] Export failed: %s\n", msg)
+		if reportErr := client.ReportJobStatus(job.ID, "failed", msg); reportErr != nil {
+			fmt.Fprintf(os.Stderr, "[agent] Export status report (failed) did not reach dashboard: %s\n", reportErr.Error())
+		}
+		return
+	}
+
+	if _, err := client.UploadExportResult(envelope); err != nil {
+		fmt.Fprintf(os.Stderr, "[agent] Export upload failed: %s\n", err.Error())
+		if reportErr := client.ReportJobStatus(job.ID, "failed", err.Error()); reportErr != nil {
+			fmt.Fprintf(os.Stderr, "[agent] Export status report (failed) did not reach dashboard: %s\n", reportErr.Error())
+		}
+		return
+	}
+
+	if err := client.ReportJobStatus(job.ID, "completed", ""); err != nil {
+		fmt.Fprintf(os.Stderr, "[agent] Export status report failed: %s\n", err.Error())
+	}
+	fmt.Fprintf(os.Stderr, "[agent] Export complete: %s -> %s (%d bytes)\n",
+		export.Source.Ref, envelope.Sink.Key, envelope.Sink.SizeBytes)
 }
 
 // refHostMatches reports whether the host portion of an image reference
