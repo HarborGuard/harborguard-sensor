@@ -105,23 +105,18 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 		fmt.Fprintf(os.Stderr, "[agent] patch capability disabled: %s\n", reason)
 	}
 
-	// Export capability requires S3 storage to be configured — the
-	// tarball lands in S3 and the dashboard receives a metadata envelope
-	// (optionally with a presigned GET URL). When S3 is missing we skip
-	// the capability so the dashboard never dispatches an export the
-	// sensor can't fulfill.
-	var exporterInstance *exporter.Exporter
-	if s3store != nil {
-		capabilities = append(capabilities, types.CapExport)
-		exporterInstance = &exporter.Exporter{
-			Config:              cfg,
-			S3Storage:           s3store,
-			SensorRegistryCreds: sensorCreds,
-		}
-		fmt.Fprintln(os.Stderr, "[agent] export capability enabled")
-	} else {
-		fmt.Fprintln(os.Stderr, "[agent] export capability disabled: sensor S3 storage is not configured")
+	// Export capability is effectively always-on: the sensor only needs
+	// skopeo (which it already requires for scan/patch) and an HTTP
+	// client to PUT to a dashboard-minted presigned URL. The dashboard
+	// double-gates dispatch on its own EXPORT_STORAGE_CONFIGURED flag,
+	// so advertising universally here keeps the gate decision in one
+	// place rather than spread across every sensor's environment.
+	capabilities = append(capabilities, types.CapExport)
+	exporterInstance := &exporter.Exporter{
+		Config:              cfg,
+		SensorRegistryCreds: sensorCreds,
 	}
+	fmt.Fprintln(os.Stderr, "[agent] export capability enabled")
 
 	agentID, err := registerWithRetry(client, types.AgentRegistration{
 		Name:            agentName,
@@ -269,12 +264,6 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 					jobCancel()
 
 				case jobType == "export" && job.Export != nil:
-					if exporterInstance == nil {
-						msg := "export job received but sensor has no S3 storage configured"
-						fmt.Fprintf(os.Stderr, "[agent] %s (job=%s)\n", msg, job.ID)
-						_ = client.ReportJobStatus(job.ID, "failed", msg)
-						continue
-					}
 					jobCtx, jobCancel := context.WithCancel(ctx)
 					cancelMu.Lock()
 					cancelMap[job.ID] = jobCancel
@@ -563,8 +552,8 @@ func processExportJob(ctx context.Context, client *AgentClient, e *exporter.Expo
 		export.Source.Insecure = true
 	}
 
-	fmt.Fprintf(os.Stderr, "[agent] Starting export: %s -> sink=s3 (compress=%t, presign=%t)\n",
-		export.Source.Ref, export.Compress, export.Sink.Presign)
+	fmt.Fprintf(os.Stderr, "[agent] Starting export: %s -> key=%s (compress=%t)\n",
+		export.Source.Ref, export.Sink.ExpectedKey, export.Compress)
 
 	envelope, err := e.Execute(ctx, types.ExportJob{
 		ID:  job.ID,
@@ -602,8 +591,8 @@ func processExportJob(ctx context.Context, client *AgentClient, e *exporter.Expo
 	if err := client.ReportJobStatus(job.ID, "completed", ""); err != nil {
 		fmt.Fprintf(os.Stderr, "[agent] Export status report failed: %s\n", err.Error())
 	}
-	fmt.Fprintf(os.Stderr, "[agent] Export complete: %s -> %s (%d bytes)\n",
-		export.Source.Ref, envelope.Sink.Key, envelope.Sink.SizeBytes)
+	fmt.Fprintf(os.Stderr, "[agent] Export complete: %s -> %s (%d bytes, sha256=%s)\n",
+		export.Source.Ref, envelope.Sink.Key, envelope.Sink.SizeBytes, envelope.Sink.Sha256)
 }
 
 // refHostMatches reports whether the host portion of an image reference

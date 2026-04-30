@@ -2,11 +2,17 @@ package exporter
 
 import (
 	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
@@ -36,59 +42,37 @@ func TestSplitNameTag(t *testing.T) {
 }
 
 func TestValidateJob(t *testing.T) {
-	t.Run("missing id", func(t *testing.T) {
-		if err := validateJob(types.ExportJob{
-			Job: types.AgentJobExport{Source: types.ImageSource{Ref: "alpine:3.18"}},
-		}); err == nil {
-			t.Fatal("expected error")
-		}
-	})
-	t.Run("missing source ref", func(t *testing.T) {
-		if err := validateJob(types.ExportJob{ID: "j1"}); err == nil {
-			t.Fatal("expected error")
-		}
-	})
+	complete := types.ExportJob{
+		ID: "j1",
+		Job: types.AgentJobExport{
+			Source: types.ImageSource{Ref: "alpine:3.18"},
+			Sink: types.ExportSink{
+				UploadURL:   "https://example.com/put",
+				ExpectedKey: "exports/j1/image.tar",
+			},
+		},
+	}
 	t.Run("ok", func(t *testing.T) {
-		if err := validateJob(types.ExportJob{
-			ID:  "j1",
-			Job: types.AgentJobExport{Source: types.ImageSource{Ref: "alpine:3.18"}},
-		}); err != nil {
+		if err := validateJob(complete); err != nil {
 			t.Fatalf("unexpected: %v", err)
 		}
 	})
-}
 
-func TestNormalizeKeyPrefix(t *testing.T) {
-	cases := []struct {
-		name    string
-		raw     string
-		jobID   string
-		want    string
-		wantErr bool
+	missing := []struct {
+		name  string
+		mut   func(*types.ExportJob)
 	}{
-		{"empty falls back to default", "", "exp_123", "exports/exp_123", false},
-		{"trailing slash trimmed", "exports/foo/", "exp_123", "exports/foo", false},
-		{"no slash preserved", "tenant-a", "exp_123", "tenant-a", false},
-		{"leading slash rejected", "/etc/passwd", "exp_123", "", true},
-		{"double-dot segment rejected", "../other-tenant", "exp_123", "", true},
-		{"double-dot deep rejected", "tenant/../escape", "exp_123", "", true},
-		{"NUL byte rejected", "foo\x00bar", "exp_123", "", true},
-		{"double-dot prefix on segment rejected", "../..foo", "exp_123", "", true},
+		{"missing id", func(j *types.ExportJob) { j.ID = "" }},
+		{"missing source ref", func(j *types.ExportJob) { j.Job.Source.Ref = "" }},
+		{"missing uploadUrl", func(j *types.ExportJob) { j.Job.Sink.UploadURL = "" }},
+		{"missing expectedKey", func(j *types.ExportJob) { j.Job.Sink.ExpectedKey = "" }},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got, err := normalizeKeyPrefix(c.raw, c.jobID)
-			if c.wantErr {
-				if err == nil {
-					t.Fatalf("expected error, got %q", got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if got != c.want {
-				t.Errorf("got %q, want %q", got, c.want)
+	for _, m := range missing {
+		t.Run(m.name, func(t *testing.T) {
+			j := complete
+			m.mut(&j)
+			if err := validateJob(j); err == nil {
+				t.Fatal("expected error")
 			}
 		})
 	}
@@ -154,5 +138,94 @@ func TestGzipFileRoundTrip(t *testing.T) {
 	}
 	if string(got) != string(payload) {
 		t.Errorf("decoded payload = %q, want %q", got, payload)
+	}
+}
+
+// httpPutFile contract: PUTs the file to the URL, returns size and
+// SHA-256 of the bytes as they appear on the wire. The fake server
+// captures the request body, recomputes the hash, and asserts it
+// matches what the function reports.
+func TestHttpPutFile(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "payload.bin")
+	// 5 MB of random-ish content so we exercise the streaming path,
+	// not just a tiny buffer that fits in a single packet.
+	payload := make([]byte, 5*1024*1024)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	if err := os.WriteFile(src, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	wantHasher := sha256.Sum256(payload)
+	wantSha := hex.EncodeToString(wantHasher[:])
+
+	var (
+		mu          sync.Mutex
+		gotMethod   string
+		gotBody     []byte
+		gotContent  string
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		gotMethod = r.Method
+		gotContent = r.Header.Get("Content-Type")
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		gotBody = body
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	size, sha, err := httpPutFile(context.Background(), srv.URL, src)
+	if err != nil {
+		t.Fatalf("httpPutFile: %v", err)
+	}
+	if size != int64(len(payload)) {
+		t.Errorf("size = %d, want %d", size, len(payload))
+	}
+	if sha != wantSha {
+		t.Errorf("sha = %q, want %q", sha, wantSha)
+	}
+	if gotMethod != http.MethodPut {
+		t.Errorf("method = %q, want PUT", gotMethod)
+	}
+	if gotContent != "" {
+		t.Errorf("Content-Type = %q, want empty (so presigned URLs that don't sign Content-Type accept the request)", gotContent)
+	}
+	if len(gotBody) != len(payload) {
+		t.Fatalf("body length = %d, want %d", len(gotBody), len(payload))
+	}
+	wireHash := sha256.Sum256(gotBody)
+	if hex.EncodeToString(wireHash[:]) != wantSha {
+		t.Errorf("on-the-wire hash != reported hash")
+	}
+}
+
+func TestHttpPutFileSurfacesNon2xx(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "payload.bin")
+	if err := os.WriteFile(src, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("SignatureDoesNotMatch"))
+	}))
+	defer srv.Close()
+
+	_, _, err := httpPutFile(context.Background(), srv.URL, src)
+	if err == nil {
+		t.Fatal("expected error on 403")
+	}
+	if !strings.Contains(err.Error(), "403") || !strings.Contains(err.Error(), "SignatureDoesNotMatch") {
+		t.Errorf("error should surface status + body, got %q", err.Error())
 	}
 }

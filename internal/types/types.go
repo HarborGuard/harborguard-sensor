@@ -421,14 +421,20 @@ const (
 	CapExport    = "export"
 )
 
-// AgentJobExport describes a job to package the source image as a tarball
-// and ship it to S3 (using the sensor's configured S3 storage).
+// AgentJobExport describes a job to package the source image as a
+// tarball and ship it to a presigned S3 PUT URL minted by the
+// dashboard.
 //
 // The sensor pulls the image to a docker-archive via skopeo, optionally
-// gzips it, and PUTs the resulting object under sink.KeyPrefix. When
-// sink.Presign is set, a time-limited GET URL is returned in the
-// envelope so the dashboard can hand the artifact off without proxying
-// multi-GB bytes through its own request path.
+// gzips it, and PUTs the resulting bytes to Sink.UploadURL. The sensor
+// holds no S3 credentials of its own — all S3 access is centralized on
+// the dashboard, which means rotating storage credentials, switching
+// providers, or applying per-tenant bucket policies all happen in one
+// place.
+//
+// Sink.Compress (false by default) is coordinated with Sink.ExpectedKey
+// — the dashboard chooses both, mints the presigned URL for the
+// resulting key, and the sensor honors what it was told.
 type AgentJobExport struct {
 	Source            ImageSource          `json:"source"`
 	SourceCredentials *RegistryCredentials `json:"sourceCredentials,omitempty"`
@@ -436,17 +442,32 @@ type AgentJobExport struct {
 	// Compress: when true, gzip the tarball before upload. Image layers
 	// inside a docker-archive are already gzipped, so a second pass
 	// typically saves <5% at meaningful CPU cost — left off by default.
+	// Must agree with the file extension implied by Sink.ExpectedKey.
 	Compress bool `json:"compress,omitempty"`
 }
 
-// ExportSink describes the S3 destination for an export job. Bucket and
-// KeyPrefix are optional; bucket defaults to the sensor's configured
-// bucket and KeyPrefix to "exports/<jobID>/".
+// ExportSink describes a dashboard-minted S3 PUT destination for an
+// export job. The sensor never picks a key or bucket itself; both are
+// chosen by the dashboard and reflected back unchanged.
+//
+// UploadURL is the presigned PUT URL the sensor will HTTP-PUT to. The
+// dashboard should mint it WITHOUT signing Content-Type so the sensor
+// can omit that header (presigned URLs that bind specific headers
+// reject any request that doesn't echo them exactly). Bucket and
+// ExpectedKey are informational — the URL itself dictates where the
+// bytes land — but the sensor reports ExpectedKey back as the
+// envelope's Sink.Key so the dashboard's bookkeeping has a confirmed
+// landing spot.
+//
+// ExpiresInSeconds tells the sensor how much wall-clock budget it has
+// from job dispatch; the sensor doesn't pre-flight against this, but
+// it lets operators trace expired-URL failures back to a dashboard-
+// side TTL setting rather than a sensor bug.
 type ExportSink struct {
-	Bucket    string `json:"bucket,omitempty"`
-	KeyPrefix string `json:"keyPrefix,omitempty"`
-	Presign   bool   `json:"presign,omitempty"`
-	TTLSecs   int    `json:"ttlSecs,omitempty"` // default 3600 if Presign && unset
+	UploadURL        string `json:"uploadUrl"`
+	ExpectedKey      string `json:"expectedKey"`
+	Bucket           string `json:"bucket,omitempty"`
+	ExpiresInSeconds int    `json:"expiresInSeconds,omitempty"`
 }
 
 // ExportJob is the internal sensor-side representation (parallels PatchJob).
@@ -478,16 +499,20 @@ type EnvelopeExport struct {
 
 // EnvelopeExportSink reports where the sensor shipped the tarball.
 //
-// Sha256 is computed over the bytes that landed in S3 — i.e. the gzipped
-// payload when Compressed=true, the raw docker-archive otherwise. This
-// lets a downloader verify integrity by hashing the object they fetched
-// without having to decompress first. SizeBytes follows the same rule:
-// it's the on-disk size of the uploaded object, not the original tar.
+// Bucket and any presigned GET URL aren't on this struct: the
+// dashboard already knows where it minted the upload URL, so echoing
+// those would just be redundant fields to keep in sync. Key is the
+// expectedKey from the job, copied through verbatim.
+//
+// Sha256 is computed over the bytes that landed in S3 — i.e. the
+// gzipped payload when Compressed=true, the raw docker-archive
+// otherwise. This lets a downloader verify integrity by hashing the
+// object they fetched without having to decompress first. SizeBytes
+// follows the same rule: it's the on-disk size of the uploaded
+// object, not the original tar.
 type EnvelopeExportSink struct {
 	Kind       string `json:"kind"` // "s3"
-	Bucket     string `json:"bucket,omitempty"`
 	Key        string `json:"key"`
-	URL        string `json:"url,omitempty"` // presigned GET URL, when requested
 	SizeBytes  int64  `json:"sizeBytes"`
 	Sha256     string `json:"sha256,omitempty"`
 	Compressed bool   `json:"compressed,omitempty"`

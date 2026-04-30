@@ -1,28 +1,36 @@
 // Package exporter packages a source container image as a tarball and
-// ships it to S3. It is the third sensor capability alongside scan and
-// patch and reuses the same skopeo/docker-archive pull pattern as those
-// flows.
+// HTTP-PUTs it to a presigned URL minted by the dashboard. It is the
+// third sensor capability alongside scan and patch and reuses the same
+// skopeo/docker-archive pull pattern.
 //
-// The exporter keeps the sensor stateless: the tarball lives in workDir
-// only between pull and upload; the workdir is removed on every exit
-// path so a crash mid-upload doesn't leak multi-GB files.
+// Storage credentials live entirely on the dashboard; the sensor never
+// needs an S3 client of its own. The dashboard mints a presigned PUT
+// URL for the expected key, and the sensor's only job is "produce the
+// bytes and PUT them." This keeps tenant isolation, key naming, and
+// bucket policy concerns in one place rather than spread across every
+// sensor deployment.
+//
+// The sensor stays stateless: the tarball lives in workDir only between
+// pull and upload; the workdir is removed on every exit path so a
+// crash mid-upload doesn't leak multi-GB files.
 package exporter
 
 import (
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/HarborGuard/harborguard-sensor/internal/scanner"
-	"github.com/HarborGuard/harborguard-sensor/internal/storage"
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
 )
 
@@ -30,24 +38,20 @@ const (
 	sensorVersion       = "0.1.0"
 	skopeoBinary        = "skopeo"
 	skopeoPullTimeoutMs = 600_000
-	defaultPresignTTL   = 3600
 	uploadTimeout       = 30 * time.Minute
 )
 
-// Exporter orchestrates an export job end-to-end.
+// Exporter orchestrates an export job end-to-end. The struct holds no
+// S3 client — the dashboard owns all storage primitives via the
+// presigned PUT URL on the job.
 type Exporter struct {
 	Config              *types.SensorConfig
-	S3Storage           *storage.S3Storage
 	SensorRegistryCreds *types.RegistryCredentials
 }
 
 // Execute runs the full export pipeline and returns an envelope describing
 // the outcome. workDir is cleaned up on every exit path.
 func (e *Exporter) Execute(ctx context.Context, job types.ExportJob) (*types.ExportEnvelope, error) {
-	if e.S3Storage == nil {
-		return nil, fmt.Errorf("export requires sensor S3 storage to be configured")
-	}
-
 	// Defensive normalization — agent loop strips schemes at the boundary,
 	// but a direct caller of Execute needs this too. Idempotent.
 	if normalized, insecure, _ := scanner.NormalizeImageRef(job.Job.Source.Ref); normalized != job.Job.Source.Ref {
@@ -84,7 +88,6 @@ func (e *Exporter) Execute(ctx context.Context, job types.ExportJob) (*types.Exp
 	}
 
 	uploadPath := tarPath
-	suffix := ".tar"
 	if job.Job.Compress {
 		gzPath := tarPath + ".gz"
 		fmt.Fprintf(os.Stderr, "[exporter] %s: compressing tarball\n", job.ID)
@@ -93,41 +96,16 @@ func (e *Exporter) Execute(ctx context.Context, job types.ExportJob) (*types.Exp
 		}
 		_ = os.Remove(tarPath)
 		uploadPath = gzPath
-		suffix = ".tar.gz"
 	}
 
-	prefix, err := normalizeKeyPrefix(job.Job.Sink.KeyPrefix, job.ID)
-	if err != nil {
-		return nil, err
-	}
-	objectName := "image-" + job.ID + suffix
-	key := path.Join(prefix, objectName)
-
-	contentType := "application/x-tar"
-	if job.Job.Compress {
-		contentType = "application/gzip"
-	}
-
-	fmt.Fprintf(os.Stderr, "[exporter] %s: uploading to s3://%s/%s\n",
-		job.ID, sinkBucketDescription(job.Job.Sink.Bucket, e.Config.S3Bucket), key)
+	fmt.Fprintf(os.Stderr, "[exporter] %s: uploading to presigned URL (key=%s, expiresIn=%ds)\n",
+		job.ID, job.Job.Sink.ExpectedKey, job.Job.Sink.ExpiresInSeconds)
 
 	uploadCtx, uploadCancel := context.WithTimeout(ctx, uploadTimeout)
 	defer uploadCancel()
-	size, sha, err := e.S3Storage.UploadArtifactStream(uploadCtx, job.Job.Sink.Bucket, key, uploadPath, contentType)
+	size, sha, err := httpPutFile(uploadCtx, job.Job.Sink.UploadURL, uploadPath)
 	if err != nil {
-		return nil, fmt.Errorf("s3 upload: %w", err)
-	}
-
-	var presignedURL string
-	if job.Job.Sink.Presign {
-		ttl := job.Job.Sink.TTLSecs
-		if ttl <= 0 {
-			ttl = defaultPresignTTL
-		}
-		presignedURL, err = e.S3Storage.PresignGetForBucket(job.Job.Sink.Bucket, key, time.Duration(ttl)*time.Second)
-		if err != nil {
-			return nil, fmt.Errorf("presigning: %w", err)
-		}
+		return nil, fmt.Errorf("upload: %w", err)
 	}
 
 	finishedAt := time.Now().UTC().Format(time.RFC3339)
@@ -148,9 +126,7 @@ func (e *Exporter) Execute(ctx context.Context, job types.ExportJob) (*types.Exp
 		},
 		Sink: types.EnvelopeExportSink{
 			Kind:       "s3",
-			Bucket:     job.Job.Sink.Bucket,
-			Key:        key,
-			URL:        presignedURL,
+			Key:        job.Job.Sink.ExpectedKey,
 			SizeBytes:  size,
 			Sha256:     sha,
 			Compressed: job.Job.Compress,
@@ -170,33 +146,76 @@ func validateJob(job types.ExportJob) error {
 	if job.Job.Source.Ref == "" {
 		return fmt.Errorf("source.ref required")
 	}
+	if job.Job.Sink.UploadURL == "" {
+		return fmt.Errorf("sink.uploadUrl required")
+	}
+	if job.Job.Sink.ExpectedKey == "" {
+		return fmt.Errorf("sink.expectedKey required")
+	}
 	return nil
 }
 
-// normalizeKeyPrefix sanitizes a dashboard-supplied KeyPrefix and falls
-// back to "exports/<jobID>" when blank. Rejects values that could escape
-// a prefix-keyed bucket policy: leading "/" anchors to the bucket root,
-// ".." segments resolve up out of the intended prefix, and NUL bytes
-// are nonsense in S3 keys regardless. path.Join cleans ".." but does
-// NOT anchor — "../foo" stays "../foo" — so the check has to happen
-// before joining.
-func normalizeKeyPrefix(raw, jobID string) (string, error) {
-	prefix := strings.TrimSuffix(raw, "/")
-	if prefix == "" {
-		return "exports/" + jobID, nil
+// httpPutFile streams a local file via HTTP PUT to uploadURL and
+// returns the byte count + SHA-256 of the bytes uploaded.
+//
+// Hash is computed in a separate pre-pass over the file (rather than a
+// TeeReader during upload). The TeeReader pattern would corrupt the
+// hash on retry: net/http rewinds the request body via Seek for redirects
+// or transient retries, but the captured hash state would not reset.
+// Two reads of the same file are cheap (the second hits the OS page
+// cache), and passing *os.File directly preserves seek-based retry.
+//
+// Caller is responsible for the upload context's timeout. We do NOT
+// set Content-Type here — the dashboard mints presigned URLs without
+// signing it, which makes the request match-anything compatible. If a
+// dashboard ever signs Content-Type into the URL it must agree with
+// what's sent or S3 returns SignatureDoesNotMatch; the design contract
+// is "don't sign Content-Type."
+//
+// Single PUT only — this means image tarballs > 5 GB will fail against
+// AWS S3 (MinIO accepts larger). Multipart-presigned uploads are a
+// separate dashboard-side workflow (initiate, mint per-part URLs,
+// complete) and intentionally out of scope here.
+func httpPutFile(ctx context.Context, uploadURL, filePath string) (int64, string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return 0, "", err
 	}
-	if strings.ContainsRune(prefix, 0) {
-		return "", fmt.Errorf("sink.keyPrefix contains NUL byte")
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return 0, "", err
 	}
-	if strings.HasPrefix(prefix, "/") {
-		return "", fmt.Errorf("sink.keyPrefix must not start with '/'")
+	size := stat.Size()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return 0, "", fmt.Errorf("hashing source: %w", err)
 	}
-	for _, seg := range strings.Split(prefix, "/") {
-		if seg == ".." {
-			return "", fmt.Errorf("sink.keyPrefix must not contain '..' segment")
-		}
+	sha := hex.EncodeToString(hasher.Sum(nil))
+
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, "", fmt.Errorf("rewinding source: %w", err)
 	}
-	return prefix, nil
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, f)
+	if err != nil {
+		return 0, "", err
+	}
+	req.ContentLength = size
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return 0, "", fmt.Errorf("PUT %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return size, sha, nil
 }
 
 // scrubCreds replaces any occurrence of the password in err.Error() with
@@ -261,13 +280,6 @@ func gzipFile(srcPath, destPath string) error {
 		return err
 	}
 	return gz.Close()
-}
-
-func sinkBucketDescription(override, fallback string) string {
-	if override != "" {
-		return override
-	}
-	return fallback
 }
 
 func imageFromRef(ref string) types.EnvelopeImage {
