@@ -446,28 +446,43 @@ type AgentJobExport struct {
 	Compress bool `json:"compress,omitempty"`
 }
 
-// ExportSink describes a dashboard-minted S3 PUT destination for an
+// ExportSink describes a dashboard-minted S3 destination for an
 // export job. The sensor never picks a key or bucket itself; both are
 // chosen by the dashboard and reflected back unchanged.
 //
-// UploadURL is the presigned PUT URL the sensor will HTTP-PUT to. The
-// dashboard should mint it WITHOUT signing Content-Type so the sensor
-// can omit that header (presigned URLs that bind specific headers
-// reject any request that doesn't echo them exactly). Bucket and
-// ExpectedKey are informational — the URL itself dictates where the
-// bytes land — but the sensor reports ExpectedKey back as the
-// envelope's Sink.Key so the dashboard's bookkeeping has a confirmed
-// landing spot.
+// UploadURL is the presigned single-PUT URL, used when the produced
+// tarball is at or below MultipartThresholdBytes. The dashboard
+// should mint it WITHOUT signing Content-Type so the sensor can omit
+// that header (presigned URLs that bind specific headers reject any
+// request that doesn't echo them exactly).
 //
-// ExpiresInSeconds tells the sensor how much wall-clock budget it has
-// from job dispatch; the sensor doesn't pre-flight against this, but
-// it lets operators trace expired-URL failures back to a dashboard-
-// side TTL setting rather than a sensor bug.
+// MultipartInitUrl/CompleteUrl/AbortUrl are dashboard endpoints (NOT
+// presigned S3 URLs — they require the agent's API key) used when the
+// payload exceeds the threshold:
+//
+//   - POST MultipartInitUrl with {"sizeBytes": N}
+//     → {uploadId, partSize, partUrls: [presigned PUT URL per part]}
+//   - PUT each part to its URL, capture ETag from response header
+//   - POST MultipartCompleteUrl with {uploadId, parts: [{partNumber, etag}, ...]}
+//   - On any failure after init: POST MultipartAbortUrl with {uploadId}
+//
+// When MultipartInitUrl is empty the sensor falls back to single-PUT
+// only — backward compatible with dashboards that haven't shipped the
+// multipart endpoints yet (the 5 GB AWS single-PUT cap then applies).
+//
+// ExpiresInSeconds is informational; lets operators trace expired-URL
+// failures back to a dashboard-side TTL setting rather than a sensor
+// bug.
 type ExportSink struct {
 	UploadURL        string `json:"uploadUrl"`
 	ExpectedKey      string `json:"expectedKey"`
 	Bucket           string `json:"bucket,omitempty"`
 	ExpiresInSeconds int    `json:"expiresInSeconds,omitempty"`
+
+	MultipartThresholdBytes int64  `json:"multipartThresholdBytes,omitempty"`
+	MultipartInitUrl        string `json:"multipartInitUrl,omitempty"`
+	MultipartCompleteUrl    string `json:"multipartCompleteUrl,omitempty"`
+	MultipartAbortUrl       string `json:"multipartAbortUrl,omitempty"`
 }
 
 // ExportJob is the internal sensor-side representation (parallels PatchJob).
