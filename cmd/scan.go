@@ -33,6 +33,7 @@ func init() {
 	scanCmd.Flags().String("output-file", "", "Write results to file")
 	scanCmd.Flags().String("upload-url", "", "Upload results to dashboard URL")
 	scanCmd.Flags().String("api-key", "", "API key for dashboard upload")
+	scanCmd.Flags().Bool("require-upload", false, "Exit non-zero (3) if dashboard upload is skipped because URL/key are unset. Set this in dispatched runs (Fly Machines, CI) where a missing URL/key is a bug; leave off for local CLI scanning.")
 	scanCmd.Flags().String("s3-bucket", "", "S3 bucket for artifact storage")
 }
 
@@ -44,6 +45,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 	outputFile, _ := cmd.Flags().GetString("output-file")
 	uploadURL, _ := cmd.Flags().GetString("upload-url")
 	apiKey, _ := cmd.Flags().GetString("api-key")
+	requireUpload, _ := cmd.Flags().GetBool("require-upload")
 	s3Bucket, _ := cmd.Flags().GetString("s3-bucket")
 	s3Key, _ := cmd.Flags().GetString("s3-key")
 
@@ -196,6 +198,22 @@ func runScan(cmd *cobra.Command, args []string) error {
 			uploadFailed = true
 		} else {
 			fmt.Fprintln(os.Stderr, "[scan] Results uploaded to dashboard")
+		}
+	} else {
+		// Production observation: under burst, some dispatched
+		// machines were silently skipping upload because url or
+		// key arrived empty (env-injection race or dispatch path
+		// gap). The previous code emitted no log either way, so
+		// the skip looked identical to a successful run. Always
+		// log the skip so the gap is visible in Fly logs.
+		keyStatus := "<set>"
+		if key == "" {
+			keyStatus = "<unset>"
+		}
+		fmt.Fprintf(os.Stderr, "[scan] Skipping dashboard upload: url=%q key=%s\n", url, keyStatus)
+		if requireUpload {
+			fmt.Fprintln(os.Stderr, "[scan] --require-upload set; treating skip as upload failure")
+			uploadFailed = true
 		}
 	}
 
