@@ -178,9 +178,23 @@ func runScan(cmd *cobra.Command, args []string) error {
 	if key == "" {
 		key = cfg.APIKey
 	}
+	var uploadFailed bool
 	if url != "" && key != "" {
 		client := agent.NewAgentClient(url, key)
-		if _, _, uploadErr := client.UploadResults(envelope); uploadErr == nil {
+
+		// Log envelope size up-front so timeout/5xx failures can be
+		// diagnosed post-mortem without re-running the scan — lets
+		// operators tell whether the 30s http.Client.Timeout was
+		// tripped by wire bandwidth (large body) or by dashboard-
+		// side parse time (small body, slow server).
+		if marshaled, marshalErr := json.Marshal(envelope); marshalErr == nil {
+			fmt.Fprintf(os.Stderr, "[scan] Uploading envelope to dashboard (%d bytes)\n", len(marshaled))
+		}
+
+		if _, _, uploadErr := client.UploadResults(envelope); uploadErr != nil {
+			fmt.Fprintf(os.Stderr, "[scan] Upload to dashboard FAILED: %s\n", uploadErr.Error())
+			uploadFailed = true
+		} else {
 			fmt.Fprintln(os.Stderr, "[scan] Results uploaded to dashboard")
 		}
 	}
@@ -206,6 +220,14 @@ func runScan(cmd *cobra.Command, args []string) error {
 			}
 			fmt.Fprintf(os.Stderr, "[scan] Full results written to %s\n", outputFile)
 		}
+	}
+
+	// Upload failure takes precedence over the CVE-found exit so
+	// operators can distinguish a delivery problem (exit 3) from a
+	// bad image (exit 1). Both still non-zero. Used to be a silent
+	// swallow — clean exit, no log, dashboard never told.
+	if uploadFailed {
+		os.Exit(3)
 	}
 
 	// Exit with non-zero if critical/high vulnerabilities found
