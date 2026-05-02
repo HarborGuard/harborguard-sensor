@@ -70,7 +70,26 @@ func RunAgentLoop(ctx context.Context, cfg *types.SensorConfig) error {
 		}
 	}
 
-	scannerVersions := getScannerVersions(cfg.EnabledScanners)
+	// Probe versions once at startup. We pre-warm for every scanner
+	// NewScanner can construct — not just the operator's enabled set —
+	// because job.Scanners is dashboard-supplied and may name a
+	// scanner the local sensor didn't enable. Without this, the per-
+	// scan fallback in fetchVersions would synchronously probe inside
+	// Execute. The cache is read-only after this point; see
+	// Orchestrator.ScannerVersions doc for the invariant.
+	allVersions := getScannerVersions(scanner.KnownScannerNames())
+	orch.ScannerVersions = allVersions
+
+	// Registration advertises only the operator-enabled set so the
+	// dashboard's view of "what this sensor will run" matches local
+	// config. Filter from the comprehensive map computed above so we
+	// don't probe the same binary twice.
+	scannerVersions := make(map[string]string, len(cfg.EnabledScanners))
+	for _, name := range cfg.EnabledScanners {
+		if v, ok := allVersions[name]; ok {
+			scannerVersions[name] = v
+		}
+	}
 
 	// Register
 	agentName := cfg.AgentName

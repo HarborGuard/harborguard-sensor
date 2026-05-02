@@ -16,6 +16,22 @@ type Scanner interface {
 	SupportsSource(source types.ImageSource) bool
 }
 
+// knownScannerNames is the canonical list of scanner names that
+// NewScanner can construct. Kept next to NewScanner so they don't
+// drift apart when a scanner is added.
+var knownScannerNames = []string{"trivy", "grype", "syft", "dockle", "dive", "osv"}
+
+// KnownScannerNames returns a copy of every scanner name NewScanner
+// understands. Callers that pre-warm version caches should use this
+// (rather than the operator's enabled-scanners list) so a dashboard-
+// dispatched job naming a non-enabled scanner doesn't cache-miss
+// inside the per-scan hot path.
+func KnownScannerNames() []string {
+	out := make([]string, len(knownScannerNames))
+	copy(out, knownScannerNames)
+	return out
+}
+
 // NewScanner creates a scanner instance by name.
 func NewScanner(name string) (Scanner, error) {
 	switch name {

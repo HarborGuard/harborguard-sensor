@@ -15,10 +15,23 @@ import (
 )
 
 // Orchestrator runs multiple scanners against an image.
+//
+// ScannerVersions is the per-scanner version-string cache. Agent mode
+// populates it once at startup (in agent.RunAgentLoop) for every
+// scanner.KnownScannerNames() entry, not just the operator-enabled
+// set, so a dashboard-dispatched job that names any constructible
+// scanner finds a hit without re-probing inside Execute. The map is
+// treated as read-only after agent startup; fetchVersions only reads
+// from it. Tests and direct callers (cmd/scan.go) may construct an
+// Orchestrator with this field nil — fetchVersions then falls back to
+// a synchronous GetVersion per scanner, single-shot rather than the
+// previous concurrent fan-out that produced "unknown" versions on
+// cold containers.
 type Orchestrator struct {
-	Config        *types.SensorConfig
-	S3Storage     *storage.S3Storage
-	RegistryCreds map[string]string // Extra env vars for registry auth (TRIVY_USERNAME, etc.)
+	Config          *types.SensorConfig
+	S3Storage       *storage.S3Storage
+	RegistryCreds   map[string]string // Extra env vars for registry auth (TRIVY_USERNAME, etc.)
+	ScannerVersions map[string]string
 }
 
 // Execute runs all configured scanners for the given job.
@@ -62,7 +75,6 @@ func (o *Orchestrator) Execute(ctx context.Context, job types.ScanJob) (*types.S
 		scanners = append(scanners, s)
 	}
 
-	// Get versions concurrently
 	versionMap := o.fetchVersions(scanners)
 
 	// For S3 source, download the tar first and run all scanners against it
@@ -161,22 +173,32 @@ func (o *Orchestrator) Execute(ctx context.Context, job types.ScanJob) (*types.S
 	}, nil
 }
 
+// fetchVersions returns the version string for each requested scanner,
+// reading from the per-orchestrator cache populated at agent startup.
+// Falls back to a synchronous GetVersion probe for any scanner the
+// cache doesn't know about — this should only happen for direct
+// callers (e.g. tests) that constructed an Orchestrator without
+// pre-warming the cache; in agent mode every scanner the dashboard
+// can dispatch was already probed once at registration.
+//
+// Used to be a goroutine-per-scanner fan-out with no concurrency cap.
+// On cold containers six concurrent fork+execs of `<tool> --version`
+// (each pulling 50–100 MB of binary off disk for the first time, with
+// trivy additionally reading its DB cache to print DB versions) would
+// race past GetToolVersion's 10 s timeout and report "unknown". The
+// asymmetry was particularly odd because runParallel below already
+// honors MaxConcurrentScanners — the version probe didn't.
 func (o *Orchestrator) fetchVersions(scanners []Scanner) map[string]string {
-	versions := make(map[string]string)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
+	versions := make(map[string]string, len(scanners))
 	for _, s := range scanners {
-		wg.Add(1)
-		go func(s Scanner) {
-			defer wg.Done()
-			v := s.GetVersion()
-			mu.Lock()
+		if v, ok := o.ScannerVersions[s.Name()]; ok {
 			versions[s.Name()] = v
-			mu.Unlock()
-		}(s)
+			continue
+		}
+		// Cache miss — synchronous probe. Single-shot, so the
+		// concurrent-fan-out hazard doesn't reappear here.
+		versions[s.Name()] = s.GetVersion()
 	}
-	wg.Wait()
 	return versions
 }
 
