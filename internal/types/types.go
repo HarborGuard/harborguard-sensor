@@ -387,7 +387,14 @@ type PatchEnvelope struct {
 
 type EnvelopePatchedImage struct {
 	Digest string `json:"digest,omitempty"`
-	Size   int64  `json:"sizeBytes,omitempty"`
+	// SizeBytes deliberately drops omitempty so that on-failure envelopes
+	// (where Patched is a defensive zero-value) still serialize as
+	// `"sizeBytes": 0` rather than being absent. The dashboard's patch-
+	// operations ingestion path does BigInt(envelope.patched.sizeBytes),
+	// and BigInt(undefined) throws — surfacing as a 500 from
+	// /api/patches/upload. Agent-mode posts real sizes so this is a
+	// no-op there; only the cmd/patch.go failure-envelope path benefits.
+	Size int64 `json:"sizeBytes"`
 }
 
 type EnvelopePatch struct {
@@ -505,11 +512,20 @@ type EnvelopeExport struct {
 	ID         string `json:"id"`
 	StartedAt  string `json:"startedAt"`
 	FinishedAt string `json:"finishedAt"`
-	// Status is always "SUCCESS" — failures don't produce an envelope
-	// (the sensor reports failed/cancelled via ReportJobStatus instead),
-	// unlike PatchEnvelope where partial-package-failure is meaningful
-	// metadata to keep around.
+	// Status: "SUCCESS" for the agent-mode path (failures there report
+	// via ReportJobStatus and never produce an envelope at all), and
+	// "SUCCESS" or "FAILED" for the one-shot cmd/export.go path (which
+	// has no /api/agent endpoints and folds failure into the same
+	// envelope shape).
 	Status string `json:"status"`
+	// Error is populated by cmd/export.go's buildFailedExportEnvelope
+	// when Status="FAILED". The dashboard's /api/exports/upload route
+	// reads `body.error ?? body.export?.error` to decide whether to
+	// flip the export row to FAILED in-band; placing the error string
+	// inside Tooling (where it used to live) was unreachable. Empty
+	// otherwise — agent-mode never sets this, so omitempty keeps the
+	// success envelope unchanged on the wire.
+	Error string `json:"error,omitempty"`
 }
 
 // EnvelopeExportSink reports where the sensor shipped the tarball.

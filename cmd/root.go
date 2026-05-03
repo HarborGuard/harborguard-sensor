@@ -15,4 +15,6 @@ func init() {
 	rootCmd.AddCommand(scanCmd)
 	rootCmd.AddCommand(agentCmd)
 	rootCmd.AddCommand(versionCmd)
+	rootCmd.AddCommand(exportCmd)
+	rootCmd.AddCommand(patchCmd)
 }
