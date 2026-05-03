@@ -34,6 +34,7 @@ func init() {
 	scanCmd.Flags().String("upload-url", "", "Upload results to dashboard URL")
 	scanCmd.Flags().String("api-key", "", "API key for dashboard upload")
 	scanCmd.Flags().Bool("require-upload", false, "Exit non-zero (3) if dashboard upload is skipped because URL/key are unset. Set this in dispatched runs (Fly Machines, CI) where a missing URL/key is a bug; leave off for local CLI scanning.")
+	scanCmd.Flags().String("scan-id", "", "Use the supplied scan ID instead of generating one. Dispatched runs (Fly Machines, CI) should pass the dashboard's scan ID so the upload envelope correlates back to the dashboard row that initiated the scan; leave off for local CLI scanning, in which case a fresh UUID is generated.")
 	scanCmd.Flags().String("s3-bucket", "", "S3 bucket for artifact storage")
 }
 
@@ -46,6 +47,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 	uploadURL, _ := cmd.Flags().GetString("upload-url")
 	apiKey, _ := cmd.Flags().GetString("api-key")
 	requireUpload, _ := cmd.Flags().GetBool("require-upload")
+	scanIDFlag, _ := cmd.Flags().GetString("scan-id")
 	s3Bucket, _ := cmd.Flags().GetString("s3-bucket")
 	s3Key, _ := cmd.Flags().GetString("s3-key")
 
@@ -83,7 +85,17 @@ func runScan(cmd *cobra.Command, args []string) error {
 		source = types.ImageSource{Type: "docker", Ref: image, Insecure: insecure}
 	}
 
-	scanID := uuid.New().String()
+	// Prefer dashboard-supplied scan ID so the envelope correlates
+	// back to the row that initiated the dispatch. Falls back to a
+	// fresh UUID for local CLI scanning where no dashboard is
+	// involved. Without this, the dashboard's upload route had to
+	// fall back to a heuristic (image-blind, race-prone under burst)
+	// to map sensor envelopes back to PENDING scan rows.
+	scanID := scanIDFlag
+	if scanID == "" {
+		scanID = uuid.New().String()
+	}
+	fmt.Fprintf(os.Stderr, "[scan] scanID=%s (supplied=%t)\n", scanID, scanIDFlag != "")
 	orch := &scanner.Orchestrator{Config: cfg}
 
 	// Initialize S3 storage if needed (for s3 source or artifact upload)
