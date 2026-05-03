@@ -16,6 +16,7 @@ import (
 	"github.com/HarborGuard/harborguard-sensor/internal/config"
 	"github.com/HarborGuard/harborguard-sensor/internal/patcher"
 	"github.com/HarborGuard/harborguard-sensor/internal/scanner"
+	"github.com/HarborGuard/harborguard-sensor/internal/storage"
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
 )
 
@@ -193,9 +194,39 @@ func runPatch(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Initialize S3 storage so non-registry sinks (s3 / presigned)
+	// dispatched via --sink-spec-json can actually push. Mirrors
+	// scan.go's gating: build only when bucket+access+secret are all
+	// set; on NewS3Storage error, fail loudly when the resolved sink
+	// requires it (s3/presigned), silently fall back to nil otherwise
+	// so registry sinks still work for operators who never configured
+	// S3. sink.New only touches S3Storage when spec.Kind == "s3" or
+	// "presigned" (see internal/patcher/sink/sink.go), so a nil here
+	// is safe for the registry case.
+	var s3store *storage.S3Storage
+	if cfg.S3Bucket != "" && cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
+		var s3err error
+		s3store, s3err = storage.NewS3Storage(types.S3Config{
+			Endpoint:  cfg.S3Endpoint,
+			Bucket:    cfg.S3Bucket,
+			AccessKey: cfg.S3AccessKey,
+			SecretKey: cfg.S3SecretKey,
+			Region:    cfg.S3Region,
+		})
+		if s3err != nil {
+			if sink.Kind == "s3" || sink.Kind == "presigned" {
+				return fmt.Errorf("sink kind %q requires valid S3 configuration: %w", sink.Kind, s3err)
+			}
+			fmt.Fprintf(os.Stderr, "[patch] S3 storage init failed (%s); registry sinks unaffected\n", s3err.Error())
+			s3store = nil
+		}
+	} else if sink.Kind == "s3" || sink.Kind == "presigned" {
+		return fmt.Errorf("sink kind %q requires S3 configuration (HG_S3_BUCKET, HG_S3_ACCESS_KEY/AWS_ACCESS_KEY_ID, HG_S3_SECRET_KEY/AWS_SECRET_ACCESS_KEY)", sink.Kind)
+	}
+
 	p := &patcher.Patcher{
 		Config:              cfg,
-		S3Storage:           nil, // s3/presigned sinks would need this; one-shot mode uses registry sink primarily
+		S3Storage:           s3store,
 		SensorRegistryCreds: sensorSinkCreds,
 	}
 

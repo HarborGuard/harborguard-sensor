@@ -542,6 +542,149 @@ func TestBuildPatchSinkSpecJSONMissingKind(t *testing.T) {
 	}
 }
 
+// TestRunPatchS3StorageInitializedFromEnv pins the env-driven S3
+// initialization wired into runPatch. It mirrors scan.go's behavior:
+// when HG_S3_BUCKET + HG_S3_ACCESS_KEY (or AWS_ACCESS_KEY_ID) +
+// HG_S3_SECRET_KEY (or AWS_SECRET_ACCESS_KEY) are all set,
+// Patcher.S3Storage must be non-nil so non-registry sinks
+// (--sink-spec-json with kind=s3 or kind=presigned) can actually push.
+// Previously cmd/patch.go hardcoded S3Storage: nil, so sink.New errored
+// for the s3/presigned cases.
+func TestRunPatchS3StorageInitializedFromEnv(t *testing.T) {
+	srv, _ := newRecorderServer(t)
+
+	// Use HG_S3_* (highest-priority alias in config.LoadConfig). Region
+	// gets a default in NewS3Storage if empty, so we don't have to set
+	// it. NewS3Storage with these stub creds shouldn't talk to AWS at
+	// construction time — it only configures the client.
+	withEnv(t, "HG_S3_BUCKET", "b")
+	withEnv(t, "HG_S3_ACCESS_KEY", "ak")
+	withEnv(t, "HG_S3_SECRET_KEY", "sk")
+	withEnv(t, "HG_S3_REGION", "us-east-1")
+
+	var captured *patcher.Patcher
+	withStubPatchExecute(t, func(ctx context.Context, p *patcher.Patcher, job types.PatchJob) (*types.PatchEnvelope, error) {
+		captured = p
+		return &types.PatchEnvelope{
+			Patch: types.EnvelopePatch{ID: job.ID, Status: "SUCCESS"},
+			Sink:  types.EnvelopePatchSink{Kind: "registry"},
+		}, nil
+	})
+
+	resetPatchFlags(t)
+	rootCmd.SetArgs([]string{
+		"patch",
+		"alpine:3.18",
+		"--patch-id", "patch-s3-env",
+		"--upload-result-url", srv.URL,
+		"--api-key", "k",
+		"--packages-json", `[{"name":"openssl","targetVersion":"3.0.2"}]`,
+		"--sink-kind", "registry",
+		"--sink-ref", "registry.example.com/app",
+		"--sink-tag", "t",
+	})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("stub never observed the Patcher")
+	}
+	if captured.S3Storage == nil {
+		t.Error("Patcher.S3Storage = nil; expected non-nil when HG_S3_* env is set (sink.New for kind=s3/presigned would fail)")
+	}
+}
+
+// TestRunPatchS3StorageNilWithoutEnvForRegistrySink confirms the
+// graceful-fallback half of the contract: when no S3 env is set and
+// the sink is registry-only, runPatch must NOT fail. Patcher.S3Storage
+// stays nil and registry-kind sinks proceed normally (sink.New only
+// touches S3Storage when spec.Kind == "s3" or "presigned").
+func TestRunPatchS3StorageNilWithoutEnvForRegistrySink(t *testing.T) {
+	srv, _ := newRecorderServer(t)
+
+	// Explicitly clear every env alias config.LoadConfig recognizes so
+	// the test isn't sensitive to ambient shell state.
+	for _, k := range []string{
+		"HG_S3_BUCKET", "S3_BUCKET",
+		"HG_S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID",
+		"HG_S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY",
+		"HG_S3_REGION", "AWS_REGION",
+		"HG_S3_ENDPOINT", "S3_ENDPOINT",
+	} {
+		withEnv(t, k, "")
+	}
+
+	var captured *patcher.Patcher
+	withStubPatchExecute(t, func(ctx context.Context, p *patcher.Patcher, job types.PatchJob) (*types.PatchEnvelope, error) {
+		captured = p
+		return &types.PatchEnvelope{
+			Patch: types.EnvelopePatch{ID: job.ID, Status: "SUCCESS"},
+			Sink:  types.EnvelopePatchSink{Kind: "registry"},
+		}, nil
+	})
+
+	resetPatchFlags(t)
+	rootCmd.SetArgs([]string{
+		"patch",
+		"alpine:3.18",
+		"--patch-id", "patch-no-s3-env",
+		"--upload-result-url", srv.URL,
+		"--api-key", "k",
+		"--packages-json", `[{"name":"openssl","targetVersion":"3.0.2"}]`,
+		"--sink-kind", "registry",
+		"--sink-ref", "registry.example.com/app",
+		"--sink-tag", "t",
+	})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("registry-kind patch must not fail when S3 env is absent: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("stub never observed the Patcher")
+	}
+	if captured.S3Storage != nil {
+		t.Errorf("Patcher.S3Storage = %v; expected nil when S3 env is absent", captured.S3Storage)
+	}
+}
+
+// TestRunPatchS3SinkRequiresS3Env is the loud-fail half. With sink
+// kind=s3 (via --sink-spec-json) and no S3 env configured, runPatch
+// must fail before invoking Execute — otherwise sink.New errors deep
+// inside the patcher and the dashboard sees an opaque buildah failure.
+func TestRunPatchS3SinkRequiresS3Env(t *testing.T) {
+	srv, _ := newRecorderServer(t)
+
+	for _, k := range []string{
+		"HG_S3_BUCKET", "S3_BUCKET",
+		"HG_S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID",
+		"HG_S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY",
+	} {
+		withEnv(t, k, "")
+	}
+
+	withStubPatchExecute(t, func(ctx context.Context, p *patcher.Patcher, job types.PatchJob) (*types.PatchEnvelope, error) {
+		t.Fatal("Execute must not run when s3 sink requested without S3 env")
+		return nil, nil
+	})
+
+	resetPatchFlags(t)
+	rootCmd.SetArgs([]string{
+		"patch",
+		"alpine:3.18",
+		"--patch-id", "patch-s3-no-env",
+		"--upload-result-url", srv.URL,
+		"--api-key", "k",
+		"--packages-json", `[{"name":"openssl","targetVersion":"3.0.2"}]`,
+		"--sink-spec-json", `{"kind":"s3","s3":{"bucket":"b","keyPrefix":"p/"}}`,
+	})
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error when sink kind=s3 but S3 env is absent")
+	}
+	if !strings.Contains(err.Error(), "S3 configuration") {
+		t.Errorf("error should call out missing S3 config; got: %v", err)
+	}
+}
+
 // Unused atomic import check — make sure we don't accidentally drop the
 // shared recorder helper from export_test.
 var _ = atomic.Int32{}
