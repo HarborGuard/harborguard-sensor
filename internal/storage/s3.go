@@ -102,14 +102,26 @@ func (s *S3Storage) UploadArtifact(key, filePath string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	contentLength := stat.Size()
-	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+	if err := s.UploadArtifactReader(ctx, key, f, stat.Size()); err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+// UploadArtifactReader uploads bytes from an arbitrary io.Reader to S3.
+//
+// Callers that need to compute a content digest in the same I/O pass as
+// the upload should wrap body with io.TeeReader(src, hasher) — the AWS
+// SDK reads body once, so each byte streams through the hasher exactly
+// once on its way to S3.
+func (s *S3Storage) UploadArtifactReader(ctx context.Context, key string, body io.Reader, contentLength int64) error {
+	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        &s.bucket,
 		Key:           &key,
-		Body:          f,
+		Body:          body,
 		ContentLength: &contentLength,
 	})
-	return key, err
+	return err
 }
 
 // GetPresignedURL returns a presigned download URL for a key.
