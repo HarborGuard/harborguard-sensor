@@ -1,7 +1,10 @@
 package scanner
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -84,6 +87,30 @@ func (o *Orchestrator) Execute(ctx context.Context, job types.ScanJob) (*types.S
 
 	compatible, incompatible := PartitionBySourceSupport(scanners, job.Source)
 
+	// Resolve the registry index/manifest digest BEFORE any scanner runs.
+	// Trivy's RepoDigests reports the per-architecture leaf manifest digest
+	// after Docker-style platform resolution, which:
+	//   (a) includes a `repo@` prefix that pollutes the value, and
+	//   (b) on registries like ECR is not directly addressable by digest —
+	//       only the index/list digest is what `aws ecr describe-images`
+	//       returns, and it's what `skopeo copy docker://repo@sha256:...`
+	//       can resolve. For single-arch images, the manifest digest IS the
+	//       index digest, so this is correct in both cases.
+	//
+	// `skopeo inspect --raw` returns the bytes of the manifest BEFORE
+	// architecture resolution, so its sha256 is the digest the registry
+	// itself indexes the tag under.
+	preferredDigest := ""
+	if job.Source.Type == "registry" {
+		if d, err := o.resolveRegistryIndexDigest(ctx, job.Source); err != nil {
+			fmt.Fprintf(os.Stderr, "[orchestrator] index digest resolution failed for %s: %v (will fall back to scanner-reported digest)\n",
+				job.Source.Ref, err)
+		} else {
+			preferredDigest = d
+			fmt.Fprintf(os.Stderr, "[orchestrator] resolved index digest for %s: %s\n", job.Source.Ref, d)
+		}
+	}
+
 	results := o.runParallel(ctx, compatible, job.Source, outputDir)
 
 	// Check for cancellation before prefetch
@@ -160,6 +187,14 @@ func (o *Orchestrator) Execute(ctx context.Context, job types.ScanJob) (*types.S
 		if _, exists := metadata.ScannerVersions[name]; !exists {
 			metadata.ScannerVersions[name] = version
 		}
+	}
+	// The registry-resolved index digest, if we got one, is canonical:
+	// it's a bare `sha256:<hex>` that the registry itself addresses the
+	// tag by. Prefer it over Trivy's per-arch RepoDigests value (which
+	// also carries a `repo@` prefix and resolves to the per-arch leaf,
+	// not the index — ECR rejects the leaf as `manifest unknown`).
+	if preferredDigest != "" {
+		metadata.ImageDigest = preferredDigest
 	}
 
 	finishedAt := time.Now().UTC().Format(time.RFC3339)
@@ -393,7 +428,13 @@ func extractImageMetadata(results map[string]*types.ScannerResult) types.ScanOut
 			if meta, ok := data["Metadata"].(map[string]interface{}); ok {
 				if digests, ok := meta["RepoDigests"].([]interface{}); ok && len(digests) > 0 {
 					if d, ok := digests[0].(string); ok {
-						imageDigest = d
+						// Trivy reports `<repo>@sha256:<hex>` (and the
+						// digest is the per-arch leaf, not the index).
+						// Strip the `repo@` prefix so consumers get a
+						// bare `sha256:<hex>`. Caller in Execute may
+						// override this with the registry-resolved
+						// index digest, which is preferred.
+						imageDigest = normalizeDigestRef(d)
 					}
 				}
 				var osName, arch string
@@ -425,7 +466,7 @@ func extractImageMetadata(results map[string]*types.ScannerResult) types.ScanOut
 			if src, ok := data["source"].(map[string]interface{}); ok {
 				if target, ok := src["target"].(map[string]interface{}); ok {
 					if d, ok := target["digest"].(string); ok {
-						imageDigest = d
+						imageDigest = normalizeDigestRef(d)
 					}
 					if s, ok := target["imageSize"].(float64); ok && imageSizeBytes == nil {
 						size := int64(s)
@@ -500,6 +541,65 @@ func NormalizeImageRef(ref string) (string, bool, bool) {
 	default:
 		return ref, false, false
 	}
+}
+
+// normalizeDigestRef strips a `repo@` prefix from a digest ref. Some scanners
+// (Trivy's RepoDigests, syft's target.digest in some shapes) report the
+// fully-qualified `<repo>@sha256:<hex>` form; downstream consumers want a
+// bare `sha256:<hex>`. We deliberately don't attempt to validate the hex —
+// callers can do that — only chop everything up to and including the last
+// `@`. Inputs already in `sha256:<hex>` form pass through unchanged.
+func normalizeDigestRef(d string) string {
+	if at := strings.LastIndex(d, "@"); at >= 0 {
+		return d[at+1:]
+	}
+	return d
+}
+
+// resolveRegistryIndexDigest fetches the raw manifest bytes for the source ref
+// and returns their sha256 in `sha256:<hex>` form. This is the digest the
+// registry itself indexes the tag under — for multi-arch images it's the
+// index/list digest, for single-arch it's the manifest digest. In both cases
+// `skopeo copy docker://<repo>@sha256:<digest>` resolves successfully, which
+// is the property the AI-triage path depends on.
+//
+// We invoke skopeo with `inspect --raw` so no architecture resolution
+// happens; the bytes we hash are exactly what the registry served. The same
+// credential plumbing as prefetchRegistryImage is used so private registries
+// (ECR, GCR, Harbor) work.
+func (o *Orchestrator) resolveRegistryIndexDigest(ctx context.Context, source types.ImageSource) (string, error) {
+	args := []string{"inspect", "--raw"}
+	if source.Insecure {
+		args = append(args, "--tls-verify=false")
+	}
+	user, pass, _ := resolveRegistryCredsSource(o.RegistryCreds)
+	if user != "" {
+		args = append(args, "--creds", user+":"+pass)
+	}
+	args = append(args, "docker://"+source.Ref)
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(timeoutCtx, "skopeo", args...)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if len(msg) > 500 {
+			msg = msg[:500] + "..."
+		}
+		return "", fmt.Errorf("skopeo inspect --raw: %w (stderr: %s)", err, msg)
+	}
+
+	raw := stdout.Bytes()
+	if len(raw) == 0 {
+		return "", fmt.Errorf("skopeo inspect --raw returned empty body")
+	}
+
+	sum := sha256.Sum256(raw)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
 // resolveRegistryCredsSource returns the same creds plus a label describing
