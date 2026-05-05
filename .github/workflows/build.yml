@@ -166,3 +166,58 @@ jobs:
       - name: Inspect Fly image
         run: |
           docker buildx imagetools inspect registry.fly.io/harborguard-sensor:${{ steps.fly-meta.outputs.version }}
+
+      # Mirror to the prod-harborguard Fly org's registry app
+      # (registry.fly.io/prod-harborguard-sensor). Fly registry tokens are
+      # org-scoped, so we need a second token. If the secret is unset (e.g.
+      # OSS forks without prod creds), all prod-mirror steps are skipped.
+      #
+      # buildx imagetools create is idempotent: if the destination tag
+      # already points at the same digest, the registry returns a no-op
+      # rather than re-uploading layers.
+      - name: Check for prod Fly token
+        id: prod-token-check
+        env:
+          FLY_REGISTRY_TOKEN_PROD: ${{ secrets.FLY_REGISTRY_TOKEN_PROD }}
+        run: |
+          if [ -n "$FLY_REGISTRY_TOKEN_PROD" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::FLY_REGISTRY_TOKEN_PROD not set, skipping prod-harborguard-sensor mirror"
+          fi
+
+      - name: Log in to Fly registry (prod org)
+        if: steps.prod-token-check.outputs.present == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: registry.fly.io
+          username: x
+          password: ${{ secrets.FLY_REGISTRY_TOKEN_PROD }}
+
+      - name: Extract metadata for Fly prod image
+        if: steps.prod-token-check.outputs.present == 'true'
+        id: fly-prod-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: registry.fly.io/prod-harborguard-sensor
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Push manifest list to Fly registry (prod org)
+        if: steps.prod-token-check.outputs.present == 'true'
+        working-directory: /tmp/digests
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.fly-prod-meta.outputs.json }}
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}@sha256:%s ' *)
+
+      - name: Inspect Fly prod image
+        if: steps.prod-token-check.outputs.present == 'true'
+        run: |
+          docker buildx imagetools inspect registry.fly.io/prod-harborguard-sensor:${{ steps.fly-prod-meta.outputs.version }}
