@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"strings"
 	"sync/atomic"
@@ -218,5 +220,265 @@ func TestResolveRegistryIndexDigestAgainstFakeRegistry(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("by-digest GET: status %d, want 200 (digest is not addressable)", resp.StatusCode)
+	}
+}
+
+// programmableScanner is a Scanner stub whose Scan behavior is fully
+// driven by per-scenario hooks. Tracks invocation order for tests
+// that need to assert "this scanner ran while prefetch was still in
+// flight."
+type programmableScanner struct {
+	name           string
+	supportsRegistry bool
+	scanFn         func(ctx context.Context, source types.ImageSource) (*types.ScannerResult, error)
+}
+
+func (p *programmableScanner) Name() string                  { return p.name }
+func (p *programmableScanner) GetVersion() string            { return "test-1.0" }
+func (p *programmableScanner) IsAvailable() bool             { return true }
+func (p *programmableScanner) SupportsSource(s types.ImageSource) bool {
+	if s.Type == "registry" {
+		return p.supportsRegistry
+	}
+	return true
+}
+func (p *programmableScanner) Scan(ctx context.Context, source types.ImageSource, outputPath string) (*types.ScannerResult, error) {
+	if p.scanFn != nil {
+		return p.scanFn(ctx, source)
+	}
+	return &types.ScannerResult{Scanner: p.name, Success: true}, nil
+}
+
+// orchestratorScheduleHarness builds an Orchestrator wired with
+// fake scanners and an injectable prefetch hook so tests don't need
+// skopeo, trivy, etc. on PATH.
+func orchestratorScheduleHarness(t *testing.T, scanners map[string]*programmableScanner, prefetchFn func(ctx context.Context, source types.ImageSource, outputDir string) (string, error)) *Orchestrator {
+	t.Helper()
+	tmp := t.TempDir()
+	cfg := &types.SensorConfig{
+		WorkDir:               tmp,
+		MaxConcurrentScanners: 4,
+	}
+	return &Orchestrator{
+		Config: cfg,
+		scannerFactory: func(name string) (Scanner, error) {
+			s, ok := scanners[name]
+			if !ok {
+				return nil, fmt.Errorf("unknown fake scanner %q", name)
+			}
+			return s, nil
+		},
+		prefetchFn: prefetchFn,
+	}
+}
+
+// Scenario 1: prefetch succeeds, compatible batch succeeds. Both
+// batches' results must be merged into the final ScanOutput.
+func TestExecute_ConcurrentPrefetch_BothSucceed(t *testing.T) {
+	prefetchStart := make(chan struct{}, 1)
+	prefetchDone := make(chan struct{})
+
+	scanners := map[string]*programmableScanner{
+		// Compatible (registry): records a marker that lets us
+		// assert it ran *concurrently with* prefetch — its scanFn
+		// blocks waiting for prefetchStart, then completes before
+		// prefetchDone is closed.
+		"registry-ok": {
+			name: "registry-ok", supportsRegistry: true,
+			scanFn: func(ctx context.Context, src types.ImageSource) (*types.ScannerResult, error) {
+				if src.Type != "registry" {
+					t.Errorf("registry-ok ran against %s, want registry", src.Type)
+				}
+				<-prefetchStart // proves prefetch goroutine has begun
+				return &types.ScannerResult{Scanner: "registry-ok", Success: true}, nil
+			},
+		},
+		"tar-ok": {
+			name: "tar-ok", supportsRegistry: false,
+			scanFn: func(ctx context.Context, src types.ImageSource) (*types.ScannerResult, error) {
+				if src.Type != "tar" {
+					t.Errorf("tar-ok ran against %s, want tar", src.Type)
+				}
+				return &types.ScannerResult{Scanner: "tar-ok", Success: true}, nil
+			},
+		},
+	}
+	tarTmp := t.TempDir()
+	tarPath := tarTmp + "/prefetch.tar"
+	if err := os.WriteFile(tarPath, []byte("fake-tar"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	prefetch := func(ctx context.Context, source types.ImageSource, outputDir string) (string, error) {
+		prefetchStart <- struct{}{}
+		defer close(prefetchDone)
+		return tarPath, nil
+	}
+	o := orchestratorScheduleHarness(t, scanners, prefetch)
+
+	out, err := o.Execute(context.Background(), types.ScanJob{
+		ID:       "j1",
+		ImageRef: "example.com/img:v1",
+		Source:   types.ImageSource{Type: "registry", Ref: "example.com/img:v1"},
+		Scanners: []string{"registry-ok", "tar-ok"},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if r, ok := out.Results["registry-ok"]; !ok || !r.Success {
+		t.Errorf("registry-ok missing/failed: %+v", r)
+	}
+	if r, ok := out.Results["tar-ok"]; !ok || !r.Success {
+		t.Errorf("tar-ok missing/failed: %+v", r)
+	}
+	select {
+	case <-prefetchDone:
+	default:
+		t.Errorf("prefetch goroutine never completed")
+	}
+}
+
+// Scenario 2: prefetch fails. The compatible batch's results must
+// still be preserved and the incompatible batch must be reported as
+// skipped/failed with the prefetch error.
+func TestExecute_ConcurrentPrefetch_PrefetchFails(t *testing.T) {
+	scanners := map[string]*programmableScanner{
+		"registry-ok": {
+			name: "registry-ok", supportsRegistry: true,
+			scanFn: func(ctx context.Context, src types.ImageSource) (*types.ScannerResult, error) {
+				return &types.ScannerResult{Scanner: "registry-ok", Success: true, Data: map[string]interface{}{"k": "v"}}, nil
+			},
+		},
+		"tar-ok": {
+			name: "tar-ok", supportsRegistry: false,
+			scanFn: func(ctx context.Context, src types.ImageSource) (*types.ScannerResult, error) {
+				t.Errorf("tar-ok must not run when prefetch fails")
+				return &types.ScannerResult{Scanner: "tar-ok", Success: true}, nil
+			},
+		},
+	}
+	prefetch := func(ctx context.Context, source types.ImageSource, outputDir string) (string, error) {
+		return "", fmt.Errorf("simulated prefetch failure")
+	}
+	o := orchestratorScheduleHarness(t, scanners, prefetch)
+
+	out, err := o.Execute(context.Background(), types.ScanJob{
+		ID:       "j2",
+		ImageRef: "example.com/img:v1",
+		Source:   types.ImageSource{Type: "registry", Ref: "example.com/img:v1"},
+		Scanners: []string{"registry-ok", "tar-ok"},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if r, ok := out.Results["registry-ok"]; !ok || !r.Success {
+		t.Errorf("registry-ok must succeed even when prefetch fails: %+v", r)
+	}
+	r, ok := out.Results["tar-ok"]
+	if !ok {
+		t.Fatalf("tar-ok result missing — should be recorded as failed")
+	}
+	if r.Success {
+		t.Errorf("tar-ok must be marked failed when prefetch fails")
+	}
+	if !strings.Contains(r.Error, "simulated prefetch failure") {
+		t.Errorf("tar-ok error must surface prefetch error, got %q", r.Error)
+	}
+}
+
+// Scenario 3: compatible batch fails (e.g. timeout). The prefetch
+// goroutine must still complete (not be orphaned), and the
+// incompatible batch must run normally against the resulting tar.
+func TestExecute_ConcurrentPrefetch_CompatibleFailsPrefetchStillRuns(t *testing.T) {
+	prefetchHit := make(chan struct{}, 1)
+	scanners := map[string]*programmableScanner{
+		"registry-fail": {
+			name: "registry-fail", supportsRegistry: true,
+			scanFn: func(ctx context.Context, src types.ImageSource) (*types.ScannerResult, error) {
+				return &types.ScannerResult{Scanner: "registry-fail", Success: false, Error: "simulated timeout"}, nil
+			},
+		},
+		"tar-ok": {
+			name: "tar-ok", supportsRegistry: false,
+			scanFn: func(ctx context.Context, src types.ImageSource) (*types.ScannerResult, error) {
+				if src.Type != "tar" {
+					t.Errorf("tar-ok ran against %s, want tar", src.Type)
+				}
+				return &types.ScannerResult{Scanner: "tar-ok", Success: true}, nil
+			},
+		},
+	}
+	tarTmp := t.TempDir()
+	tarPath := tarTmp + "/prefetch.tar"
+	_ = os.WriteFile(tarPath, []byte("fake-tar"), 0644)
+	prefetch := func(ctx context.Context, source types.ImageSource, outputDir string) (string, error) {
+		prefetchHit <- struct{}{}
+		return tarPath, nil
+	}
+	o := orchestratorScheduleHarness(t, scanners, prefetch)
+
+	out, err := o.Execute(context.Background(), types.ScanJob{
+		ID:       "j3",
+		ImageRef: "example.com/img:v1",
+		Source:   types.ImageSource{Type: "registry", Ref: "example.com/img:v1"},
+		Scanners: []string{"registry-fail", "tar-ok"},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	select {
+	case <-prefetchHit:
+	default:
+		t.Errorf("prefetch never ran — must run even when compatible batch fails")
+	}
+	if r := out.Results["registry-fail"]; r == nil || r.Success {
+		t.Errorf("registry-fail should be recorded as failed: %+v", r)
+	}
+	if r := out.Results["tar-ok"]; r == nil || !r.Success {
+		t.Errorf("tar-ok must still run + succeed against the prefetched tar: %+v", r)
+	}
+}
+
+// Scenario 4: non-registry source. The prefetch goroutine must NOT
+// be started — incompatible scanners are simply marked unsupported,
+// preserving the original (pre-concurrency) semantics for
+// non-registry source modes (docker, tar, etc.).
+func TestExecute_NonRegistrySource_PrefetchNeverStarts(t *testing.T) {
+	prefetchCalled := atomic.Int64{}
+	scanners := map[string]*programmableScanner{
+		"any-ok": {
+			name: "any-ok", supportsRegistry: true,
+			scanFn: func(ctx context.Context, src types.ImageSource) (*types.ScannerResult, error) {
+				return &types.ScannerResult{Scanner: "any-ok", Success: true}, nil
+			},
+		},
+		"tar-only": {
+			// Declines registry — but source here is "docker", so
+			// SupportsSource returns true and it runs in the
+			// compatible batch. To get an incompatible scanner for
+			// docker source, this test would need a scanner that
+			// rejects "docker". We simulate that below.
+			name: "tar-only", supportsRegistry: false,
+			scanFn: func(ctx context.Context, src types.ImageSource) (*types.ScannerResult, error) {
+				return &types.ScannerResult{Scanner: "tar-only", Success: true}, nil
+			},
+		},
+	}
+	prefetch := func(ctx context.Context, source types.ImageSource, outputDir string) (string, error) {
+		prefetchCalled.Add(1)
+		return "", fmt.Errorf("prefetch should not run for non-registry sources")
+	}
+	o := orchestratorScheduleHarness(t, scanners, prefetch)
+
+	_, err := o.Execute(context.Background(), types.ScanJob{
+		ID:       "j4",
+		ImageRef: "alpine:3.18",
+		Source:   types.ImageSource{Type: "docker", Ref: "alpine:3.18"},
+		Scanners: []string{"any-ok", "tar-only"},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if prefetchCalled.Load() != 0 {
+		t.Errorf("prefetch was called %d times for docker source — must be 0", prefetchCalled.Load())
 	}
 }

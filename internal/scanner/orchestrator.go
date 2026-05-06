@@ -35,6 +35,25 @@ type Orchestrator struct {
 	S3Storage       *storage.S3Storage
 	RegistryCreds   map[string]string // Extra env vars for registry auth (TRIVY_USERNAME, etc.)
 	ScannerVersions map[string]string
+
+	// prefetchFn, if set, replaces the default skopeo-backed
+	// prefetchRegistryImage. Tests use this to exercise the
+	// concurrent prefetch + compatible-batch scheduling without
+	// standing up an OCI registry. Production code leaves this nil
+	// and the default (skopeo) implementation runs.
+	prefetchFn func(ctx context.Context, source types.ImageSource, outputDir string) (string, error)
+
+	// scannerFactory, if set, replaces NewScanner during Execute.
+	// Lets tests substitute fake scanners without invoking real
+	// trivy/grype/syft binaries. Production leaves this nil.
+	scannerFactory func(name string) (Scanner, error)
+}
+
+func (o *Orchestrator) prefetch(ctx context.Context, source types.ImageSource, outputDir string) (string, error) {
+	if o.prefetchFn != nil {
+		return o.prefetchFn(ctx, source, outputDir)
+	}
+	return o.prefetchRegistryImage(ctx, source, outputDir)
 }
 
 // Execute runs all configured scanners for the given job.
@@ -69,9 +88,13 @@ func (o *Orchestrator) Execute(ctx context.Context, job types.ScanJob) (*types.S
 		scannerNames = o.Config.EnabledScanners
 	}
 
+	factory := o.scannerFactory
+	if factory == nil {
+		factory = NewScanner
+	}
 	scanners := make([]Scanner, 0, len(scannerNames))
 	for _, name := range scannerNames {
-		s, err := NewScanner(name)
+		s, err := factory(name)
 		if err != nil {
 			return nil, err
 		}
@@ -111,22 +134,69 @@ func (o *Orchestrator) Execute(ctx context.Context, job types.ScanJob) (*types.S
 		}
 	}
 
-	results := o.runParallel(ctx, compatible, job.Source, outputDir)
-
-	// Check for cancellation before prefetch
-	if ctx.Err() != nil {
-		return o.buildCancelledOutput(job, startedAt, results, versionMap), nil
+	// Concurrent-prefetch optimization:
+	//
+	// Historically, runParallel(compatible) ran to completion BEFORE
+	// prefetchRegistryImage was called. On networks with degraded
+	// outbound bandwidth (the May 2026 staging incident, see RCA),
+	// scanners that talk to the registry directly (Trivy/Grype/OSV)
+	// would each pull the image themselves, then we'd still pay the
+	// full skopeo prefetch wallclock afterwards before Syft/Dockle/Dive
+	// could start. The two batches share zero network artifacts but
+	// were serialized.
+	//
+	// Now: kick off prefetch in a goroutine concurrent with the
+	// compatible batch (only for "registry" sources with incompatible
+	// scanners to feed; other source types still take the original
+	// inline path). The result lands on prefetchCh which the
+	// post-compatible-batch code drains before running the incompatible
+	// batch against the tar. ctx propagation keeps the goroutine from
+	// being orphaned if the compatible batch fails or the parent
+	// cancels.
+	type prefetchOutcome struct {
+		tarPath string
+		err     error
 	}
-
-	// For registry source, prefetch image and run incompatible scanners on tar
-	if job.Source.Type == "registry" && len(incompatible) > 0 {
+	prefetchActive := job.Source.Type == "registry" && len(incompatible) > 0
+	var prefetchCh chan prefetchOutcome
+	if prefetchActive {
 		names := make([]string, len(incompatible))
 		for i, s := range incompatible {
 			names[i] = s.Name()
 		}
-		fmt.Fprintf(os.Stderr, "[orchestrator] Prefetching %s for %d scanner(s): %v\n",
+		fmt.Fprintf(os.Stderr, "[orchestrator] Prefetching %s for %d scanner(s) concurrently with compatible batch: %v\n",
 			job.Source.Ref, len(incompatible), names)
-		tarPath, err := o.prefetchRegistryImage(ctx, job.Source, outputDir)
+		prefetchCh = make(chan prefetchOutcome, 1)
+		go func() {
+			tarPath, err := o.prefetch(ctx, job.Source, outputDir)
+			prefetchCh <- prefetchOutcome{tarPath: tarPath, err: err}
+		}()
+	}
+
+	results := o.runParallel(ctx, compatible, job.Source, outputDir)
+
+	// Check for cancellation before consuming prefetch
+	if ctx.Err() != nil {
+		// Drain the prefetch goroutine so it doesn't leak. The
+		// underlying skopeo CommandContext is bound to ctx and will
+		// terminate; we just have to wait for the channel send.
+		if prefetchActive {
+			outcome := <-prefetchCh
+			if outcome.tarPath != "" {
+				_ = os.Remove(outcome.tarPath)
+			}
+		}
+		return o.buildCancelledOutput(job, startedAt, results, versionMap), nil
+	}
+
+	// For registry source, run incompatible scanners on the prefetched tar
+	if prefetchActive {
+		names := make([]string, len(incompatible))
+		for i, s := range incompatible {
+			names[i] = s.Name()
+		}
+		outcome := <-prefetchCh
+		tarPath, err := outcome.tarPath, outcome.err
 		if err != nil {
 			if ctx.Err() != nil {
 				return o.buildCancelledOutput(job, startedAt, results, versionMap), nil
@@ -267,13 +337,33 @@ func (o *Orchestrator) runParallel(ctx context.Context, scanners []Scanner, sour
 			go func(s Scanner) {
 				defer wg.Done()
 				outputPath := filepath.Join(outputDir, s.Name()+".json")
+				// Successful scanner runs were previously silent — only
+				// failures emitted log lines. That made `flyctl logs`
+				// useless for diagnosing slow-but-successful scans
+				// because timings only lived inside the JSON envelope
+				// uploaded at the end. Log start/finish at INFO so
+				// per-scanner wallclock is visible in real time.
+				fmt.Fprintf(os.Stderr, "[scanner] %s started source=%s\n", s.Name(), source.Type)
+				scanStart := time.Now()
 				result, err := s.Scan(ctx, source, outputPath)
+				durMs := time.Since(scanStart).Milliseconds()
 				if err != nil {
 					result = &types.ScannerResult{
 						Scanner: s.Name(),
 						Success: false,
 						Error:   err.Error(),
 					}
+				}
+				if result != nil && result.Success {
+					fmt.Fprintf(os.Stderr, "[scanner] %s finished duration_ms=%d exit_code=0\n", s.Name(), durMs)
+				} else {
+					errMsg := ""
+					if result != nil {
+						errMsg = result.Error
+					} else if err != nil {
+						errMsg = err.Error()
+					}
+					fmt.Fprintf(os.Stderr, "[scanner] %s failed duration_ms=%d error=%q\n", s.Name(), durMs, errMsg)
 				}
 				mu.Lock()
 				results[s.Name()] = result
