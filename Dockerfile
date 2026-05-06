@@ -69,20 +69,44 @@ RUN apk add --no-cache curl bash ca-certificates skopeo buildah netavark fuse-ov
   && chmod +x /usr/local/bin/osv-scanner \
   && rm -rf /tmp/* /var/tmp/*
 
-# Binary
-COPY --from=builder /harborguard-sensor /usr/local/bin/harborguard-sensor
-
-# Workspace
+# Workspace (writable runtime caches; populated by sensor-init.sh from the
+# baked /opt/sensor/db layer at container start).
 RUN mkdir -p /workspace/cache/trivy/db /workspace/cache/grype /workspace/cache/syft /workspace/reports
 
 ENV TRIVY_CACHE_DIR=/workspace/cache/trivy
 ENV GRYPE_DB_CACHE_DIR=/workspace/cache/grype
 ENV SYFT_CACHE_DIR=/workspace/cache/syft
 
-# Pre-bake scanner databases so containers start without cold-start downloads
-RUN trivy image --download-db-only && grype db update
+# Pre-bake scanner databases so ephemeral scan machines start without
+# cold-start DB downloads (~3 minutes saved per cold scan).
+#
+# Each scanner gets its own RUN to keep layers cache-friendly: a Trivy DB
+# refresh doesn't bust the Grype layer and vice-versa. The DB content is
+# sourced via the scanner's own update flow (Trivy: ghcr.io/aquasecurity/
+# trivy-db OCI; Grype: grype.anchore.io listing) so we always bake what
+# the installed binary version expects.
+#
+# The DBs live at /opt/sensor/db/{trivy,grype} (read-only, layer-resident).
+# /workspace/cache is hydrated from this path by /usr/local/bin/sensor-init.sh
+# before the sensor binary runs, so scanners get a writable cache without
+# re-downloading.
+RUN mkdir -p /opt/sensor/db/trivy /opt/sensor/db/grype \
+  && TRIVY_CACHE_DIR=/opt/sensor/db/trivy trivy image --download-db-only
+
+RUN GRYPE_DB_CACHE_DIR=/opt/sensor/db/grype grype db update
+
+# Binary (placed late so daily DB-only refreshes don't bust the binary
+# layer's cache — though our CI rebuilds top-down, this is still the
+# correct ordering for any local incremental builds).
+COPY --from=builder /harborguard-sensor /usr/local/bin/harborguard-sensor
+
+# Init script hydrates /workspace/cache (or $HG_SCRATCH_DIR) from the
+# baked /opt/sensor/db tree, then execs the sensor.
+COPY scripts/sensor-init.sh /usr/local/bin/sensor-init.sh
+RUN chmod +x /usr/local/bin/sensor-init.sh
 
 # tini reaps zombies (e.g. fuse-overlayfs daemons reparented to PID 1
-# when buildah exits) and forwards signals to the sensor.
-ENTRYPOINT ["/sbin/tini", "--", "harborguard-sensor"]
+# when buildah exits) and forwards signals to the sensor. sensor-init.sh
+# does the DB hydration then exec's the real binary.
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/sensor-init.sh", "harborguard-sensor"]
 CMD ["agent"]
