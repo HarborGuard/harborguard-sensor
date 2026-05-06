@@ -173,6 +173,13 @@ func (o *Orchestrator) Execute(ctx context.Context, job types.ScanJob) (*types.S
 		}()
 	}
 
+	// For pre-supplied tar sources (CLI dispatch with a local archive),
+	// emit telemetry up front. Registry sources are handled after prefetch
+	// completes; S3 sources are handled in executeS3.
+	if job.Source.Type == "tar" && job.Source.Path != "" {
+		emitJavaTelemetry(job.ID, job.ImageRef, job.Source.Path)
+	}
+
 	results := o.runParallel(ctx, compatible, job.Source, outputDir)
 
 	// Check for cancellation before consuming prefetch
@@ -217,6 +224,10 @@ func (o *Orchestrator) Execute(ctx context.Context, job types.ScanJob) (*types.S
 			}
 			fmt.Fprintf(os.Stderr, "[orchestrator] Prefetch complete: %s (%d bytes). Running %v against tar.\n",
 				tarPath, tarSize, names)
+			// Always-on telemetry: count Java-bearing files in the
+			// prefetched tar so we can size bake-vs-fetch tradeoffs
+			// for the trivy java-db. Cheap walk, errors logged inline.
+			emitJavaTelemetry(job.ID, job.ImageRef, tarPath)
 			// Run incompatible scanners against the tar
 			tarSource := types.ImageSource{Type: "tar", Path: tarPath}
 			tarResults := o.runParallel(ctx, incompatible, tarSource, outputDir)
@@ -393,6 +404,7 @@ func (o *Orchestrator) executeS3(ctx context.Context, job types.ScanJob, scanner
 	defer os.Remove(tarPath)
 
 	fmt.Fprintf(os.Stderr, "[orchestrator] Running all scanners against S3 tar: %s\n", job.Source.S3Key)
+	emitJavaTelemetry(job.ID, job.ImageRef, tarPath)
 	tarSource := types.ImageSource{Type: "tar", Path: tarPath}
 	results := o.runParallel(ctx, scanners, tarSource, outputDir)
 
