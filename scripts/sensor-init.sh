@@ -1,25 +1,91 @@
 #!/bin/sh
-# sensor-init.sh — hydrate runtime scanner DB caches from the baked layer.
+# sensor-init.sh — hydrate runtime scanner DB caches from the baked layer,
+# OR (HG_DB_DIRECT_READ=1) point scanners at the read-only baked dir directly.
 #
 # At build time the Dockerfile pre-downloads Trivy + Grype databases into
 # /opt/sensor/db/{trivy,grype}. Those paths are read-only and shared across
-# the multi-stage rootfs. Scanners want a writable cache dir so they can
-# update metadata and (if needed) fetch deltas. We hydrate the runtime
-# cache here, before exec'ing the sensor.
+# the multi-stage rootfs.
 #
-# Two modes, gated by HG_SCRATCH_DIR:
-#   unset (default) — hydrate to /workspace/cache and read from rootfs-backed dir
-#   set (e.g. /dev/shm/sensor) — copy to tmpfs for hot reads
+# Modes (selection priority: HG_DB_DIRECT_READ > HG_SCRATCH_DIR > default):
+#   HG_DB_DIRECT_READ=1
+#       Skip hydration entirely. Point TRIVY_CACHE_DIR / GRYPE_DB_CACHE_DIR
+#       at the baked /opt/sensor/db tree. Set scanner "skip update" env vars
+#       so scanners do not attempt to write into the read-only paths.
+#       If CAP_SYS_ADMIN is available, additionally bind-mount the baked
+#       paths read-only over themselves to make any stray write attempt
+#       EROFS-fail loudly (defense in depth). Bind-mount failure is
+#       non-fatal — env vars alone are sufficient since we don't update
+#       and scanners use temp files in /tmp for working state.
+#   HG_SCRATCH_DIR=<path> (e.g. /dev/shm/sensor)
+#       Hydrate to that path (typically tmpfs).
+#   default
+#       Hydrate to /workspace/cache (rootfs-backed).
 #
-# Failure semantics: the hydration is best-effort. If the baked layer is
-# missing (e.g. local dev image built without DBs), or the destination is
-# already populated (re-exec from a recovered Fly Machine), we no-op and
-# defer to the agent's own warmupScannerDBs() fallback.
+# Failure semantics: hydration is best-effort (missing baked DB → no-op,
+# defer to agent's warmupScannerDBs fallback). Direct-read mode is strict:
+# if the baked DB is missing it errors out, since there's nothing to read.
 
 set -eu
 
 BAKED_TRIVY="/opt/sensor/db/trivy"
 BAKED_GRYPE="/opt/sensor/db/grype"
+
+# ---------------------------------------------------------------------------
+# Mode 2: direct read from baked DB. No copy, no hydration.
+# ---------------------------------------------------------------------------
+if [ "${HG_DB_DIRECT_READ:-0}" = "1" ]; then
+    if [ ! -d "$BAKED_TRIVY" ] || [ -z "$(ls -A "$BAKED_TRIVY" 2>/dev/null)" ]; then
+        echo "[sensor-init] ERROR: HG_DB_DIRECT_READ=1 but $BAKED_TRIVY missing/empty" >&2
+        exit 1
+    fi
+    if [ ! -d "$BAKED_GRYPE" ] || [ -z "$(ls -A "$BAKED_GRYPE" 2>/dev/null)" ]; then
+        echo "[sensor-init] ERROR: HG_DB_DIRECT_READ=1 but $BAKED_GRYPE missing/empty" >&2
+        exit 1
+    fi
+
+    export TRIVY_CACHE_DIR="$BAKED_TRIVY"
+    export GRYPE_DB_CACHE_DIR="$BAKED_GRYPE"
+
+    # Air-gap env vars: prevent the scanners from attempting DB updates that
+    # would write into the read-only baked paths.
+    #
+    # Trivy v0.69.x:
+    #   TRIVY_SKIP_DB_UPDATE        — skip vuln DB pull
+    #   TRIVY_SKIP_JAVA_DB_UPDATE   — skip java index DB pull
+    # Grype v0.x:
+    #   GRYPE_DB_AUTO_UPDATE=false  — never check / fetch listing.json
+    #   GRYPE_DB_VALIDATE_AGE=false — don't refuse to scan if DB is "stale"
+    export TRIVY_SKIP_DB_UPDATE=true
+    export TRIVY_SKIP_JAVA_DB_UPDATE=true
+    export GRYPE_DB_AUTO_UPDATE=false
+    export GRYPE_DB_VALIDATE_AGE=false
+
+    # Tell the agent the DB is "present" so warmupScannerDBs no-ops. Its
+    # check is dbDirHasContent() on the cache dir, which the baked path
+    # satisfies. Nothing extra needed.
+
+    # Best-effort RO bind mount over the baked paths. Requires CAP_SYS_ADMIN
+    # in the container. Silently skip on failure — env vars alone suffice.
+    if mount --bind -o ro "$BAKED_TRIVY" "$BAKED_TRIVY" 2>/dev/null \
+        && mount --bind -o ro "$BAKED_GRYPE" "$BAKED_GRYPE" 2>/dev/null; then
+        # Linux requires a remount,ro after the initial bind to enforce RO.
+        if mount -o remount,ro,bind "$BAKED_TRIVY" 2>/dev/null \
+            && mount -o remount,ro,bind "$BAKED_GRYPE" 2>/dev/null; then
+            echo "[sensor-init] direct-read: baked DBs bind-mounted RO (defense in depth)" >&2
+        else
+            echo "[sensor-init] direct-read: bind ok but remount-ro failed; relying on env vars" >&2
+        fi
+    else
+        echo "[sensor-init] direct-read: no CAP_SYS_ADMIN for RO bind-mount; relying on env vars only" >&2
+    fi
+
+    echo "[sensor-init] direct-read: TRIVY_CACHE_DIR=$TRIVY_CACHE_DIR GRYPE_DB_CACHE_DIR=$GRYPE_DB_CACHE_DIR (no hydration)" >&2
+    exec "$@"
+fi
+
+# ---------------------------------------------------------------------------
+# Modes 0 / 1: hydrate to writable cache dir.
+# ---------------------------------------------------------------------------
 
 # Resolve runtime cache root.
 if [ -n "${HG_SCRATCH_DIR:-}" ]; then
