@@ -78,6 +78,19 @@ func (g *GrypeScanner) IsAvailable() bool {
 	return IsToolAvailable("grype")
 }
 
-func (g *GrypeScanner) SupportsSource(_ types.ImageSource) bool {
-	return true
+// SupportsSource declines "registry" so the orchestrator routes grype through
+// the skopeo prefetch → tar path used by syft/dockle/dive. Reason: grype's
+// `registry:` source uses go-containerregistry, which does not honor ECR's
+// auth pattern even when GRYPE_REGISTRY_AUTH_USERNAME/PASSWORD are set with a
+// valid `aws ecr get-login-password` token. The May 2026 staging soak showed
+// 5/6 organic scans failing with `401 Unauthorized: Not Authorized` from ECR,
+// while the same machine's skopeo prefetch (running with the SAME credentials
+// from RegistryCreds) succeeded. Routing grype through `docker-archive:`
+// against the prefetched tar bypasses the credential issue entirely and
+// matches the pattern syft already uses.
+//
+// "docker" and "tar" sources continue to work as before (grype reads them
+// directly without any registry round-trip).
+func (g *GrypeScanner) SupportsSource(source types.ImageSource) bool {
+	return source.Type != "registry"
 }

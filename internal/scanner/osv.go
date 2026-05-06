@@ -111,6 +111,20 @@ func (o *OsvScanner) IsAvailable() bool {
 	return IsToolAvailable("osv-scanner")
 }
 
-func (o *OsvScanner) SupportsSource(_ types.ImageSource) bool {
-	return true
+// SupportsSource declines "registry" so the orchestrator routes osv (and the
+// internal syft SBOM-generation step) through the skopeo prefetch → tar
+// path. Reason: when the source is registry, osv's syft fallback hits the
+// registry directly with go-containerregistry — which does not honor ECR
+// auth even when SYFT_REGISTRY_AUTH_USERNAME/PASSWORD are set (same root
+// cause as the grype regression observed in the May 2026 staging soak: 6/6
+// osv scans failed with `401 Unauthorized: Not Authorized`).
+//
+// Routing osv through the tar makes its internal syft call use
+// `docker-archive:` source (no registry round-trip, no credential plumbing
+// required). Reuse of the main syft scanner's `sbom.cdx.json` continues to
+// work — both run in the incompatible batch concurrently against the same
+// tar; if syft writes its SBOM first osv reuses it, otherwise osv generates
+// its own from the tar (same operation, just duplicated).
+func (o *OsvScanner) SupportsSource(source types.ImageSource) bool {
+	return source.Type != "registry"
 }

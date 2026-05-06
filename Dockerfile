@@ -91,7 +91,16 @@ ENV SYFT_CACHE_DIR=/workspace/cache/syft
 # before the sensor binary runs, so scanners get a writable cache without
 # re-downloading.
 RUN mkdir -p /opt/sensor/db/trivy /opt/sensor/db/grype \
-  && TRIVY_CACHE_DIR=/opt/sensor/db/trivy trivy image --download-db-only
+  && TRIVY_CACHE_DIR=/opt/sensor/db/trivy trivy image --download-db-only \
+  # Bake Trivy's Java index DB alongside the vuln DB. Trivy refuses to
+  # honor TRIVY_SKIP_JAVA_DB_UPDATE on first run when the java-db cache
+  # is empty: it will hit FATAL `'--skip-java-db-update' cannot be
+  # specified on the first run` and exit 1 even if the scanned image has
+  # no Java content. Observed in the May 2026 staging soak (3 of 8 scans
+  # failed this way under HG_DB_DIRECT_READ=1, where the cache dir is
+  # the read-only baked path and first-run download is impossible).
+  # Baking it adds ~10MB and removes the failure mode entirely.
+  && TRIVY_CACHE_DIR=/opt/sensor/db/trivy trivy image --download-java-db-only
 
 RUN GRYPE_DB_CACHE_DIR=/opt/sensor/db/grype grype db update
 
