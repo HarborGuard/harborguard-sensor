@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
@@ -25,11 +26,17 @@ func (d *DiveScanner) Scan(ctx context.Context, source types.ImageSource, output
 	}
 
 	cmd := d.buildCommand(source, outputPath)
-	_, _, err := ExecWithTimeout(ctx, cmd, diveTimeoutMs, nil)
+	stdout, stderr, err := ExecWithTimeout(ctx, cmd, diveTimeoutMs, nil)
 	durationMs := time.Since(start).Milliseconds()
 
 	if err != nil {
 		msg := err.Error()
+		if s := strings.TrimSpace(stderr); s != "" {
+			msg += "\n--- dive stderr ---\n" + s
+		}
+		if s := strings.TrimSpace(stdout); s != "" {
+			msg += "\n--- dive stdout ---\n" + s
+		}
 		fmt.Fprintf(os.Stderr, "Dive scan failed: %s\n", msg)
 		_ = WriteFallbackResult(outputPath, msg, map[string]interface{}{"layer": []interface{}{}})
 		return &types.ScannerResult{Scanner: "dive", Success: false, Error: msg, DurationMs: durationMs}, nil

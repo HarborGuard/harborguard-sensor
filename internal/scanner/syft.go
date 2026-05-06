@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
@@ -36,16 +37,23 @@ func (s *SyftScanner) Scan(ctx context.Context, source types.ImageSource, output
 
 	// Main JSON output (retry once on transient failure)
 	cmd := fmt.Sprintf(`syft %s -o json > "%s"`, ref, outputPath)
-	_, _, err := ExecWithTimeout(ctx, cmd, syftTimeoutMs, env)
+	stdout, stderr, err := ExecWithTimeout(ctx, cmd, syftTimeoutMs, env)
 	if err != nil && ctx.Err() == nil {
 		fmt.Fprintf(os.Stderr, "Syft scan failed, retrying: %s\n", err.Error())
 		time.Sleep(2 * time.Second)
-		_, _, err = ExecWithTimeout(ctx, cmd, syftTimeoutMs, env)
+		stdout, stderr, err = ExecWithTimeout(ctx, cmd, syftTimeoutMs, env)
 	}
 	if err != nil {
 		msg := err.Error()
 		if ctx.Err() != nil {
 			msg = "scan cancelled"
+		} else {
+			if s := strings.TrimSpace(stderr); s != "" {
+				msg += "\n--- syft stderr ---\n" + s
+			}
+			if s := strings.TrimSpace(stdout); s != "" {
+				msg += "\n--- syft stdout ---\n" + s
+			}
 		}
 		fmt.Fprintf(os.Stderr, "Syft scan failed: %s\n", msg)
 		_ = WriteFallbackResult(outputPath, msg, nil)
@@ -56,9 +64,16 @@ func (s *SyftScanner) Scan(ctx context.Context, source types.ImageSource, output
 	// CycloneDX SBOM (skip if cancelled)
 	if ctx.Err() == nil {
 		sbomCmd := fmt.Sprintf(`syft %s -o cyclonedx-json@1.5 > "%s"`, ref, sbomPath)
-		_, _, err = ExecWithTimeout(ctx, sbomCmd, syftTimeoutMs, env)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Syft SBOM generation failed: %s\n", err.Error())
+		sbomStdout, sbomStderr, sbomErr := ExecWithTimeout(ctx, sbomCmd, syftTimeoutMs, env)
+		if sbomErr != nil {
+			msg := sbomErr.Error()
+			if s := strings.TrimSpace(sbomStderr); s != "" {
+				msg += "\n--- syft sbom stderr ---\n" + s
+			}
+			if s := strings.TrimSpace(sbomStdout); s != "" {
+				msg += "\n--- syft sbom stdout ---\n" + s
+			}
+			fmt.Fprintf(os.Stderr, "Syft SBOM generation failed: %s\n", msg)
 		}
 	}
 

@@ -11,11 +11,10 @@
 #       Skip hydration entirely. Point TRIVY_CACHE_DIR / GRYPE_DB_CACHE_DIR
 #       at the baked /opt/sensor/db tree. Set scanner "skip update" env vars
 #       so scanners do not attempt to write into the read-only paths.
-#       If CAP_SYS_ADMIN is available, additionally bind-mount the baked
-#       paths read-only over themselves to make any stray write attempt
-#       EROFS-fail loudly (defense in depth). Bind-mount failure is
-#       non-fatal — env vars alone are sufficient since we don't update
-#       and scanners use temp files in /tmp for working state.
+#       The skip-update env vars alone are the gating mechanism: scanners
+#       won't attempt DB writes through them (verified locally), and Fly
+#       machines don't grant CAP_SYS_ADMIN so a "defense in depth" RO bind
+#       mount is not available anyway.
 #   HG_SCRATCH_DIR=<path> (e.g. /dev/shm/sensor)
 #       Hydrate to that path (typically tmpfs).
 #   default
@@ -63,21 +62,6 @@ if [ "${HG_DB_DIRECT_READ:-0}" = "1" ]; then
     # Tell the agent the DB is "present" so warmupScannerDBs no-ops. Its
     # check is dbDirHasContent() on the cache dir, which the baked path
     # satisfies. Nothing extra needed.
-
-    # Best-effort RO bind mount over the baked paths. Requires CAP_SYS_ADMIN
-    # in the container. Silently skip on failure — env vars alone suffice.
-    if mount --bind -o ro "$BAKED_TRIVY" "$BAKED_TRIVY" 2>/dev/null \
-        && mount --bind -o ro "$BAKED_GRYPE" "$BAKED_GRYPE" 2>/dev/null; then
-        # Linux requires a remount,ro after the initial bind to enforce RO.
-        if mount -o remount,ro,bind "$BAKED_TRIVY" 2>/dev/null \
-            && mount -o remount,ro,bind "$BAKED_GRYPE" 2>/dev/null; then
-            echo "[sensor-init] direct-read: baked DBs bind-mounted RO (defense in depth)" >&2
-        else
-            echo "[sensor-init] direct-read: bind ok but remount-ro failed; relying on env vars" >&2
-        fi
-    else
-        echo "[sensor-init] direct-read: no CAP_SYS_ADMIN for RO bind-mount; relying on env vars only" >&2
-    fi
 
     echo "[sensor-init] direct-read: TRIVY_CACHE_DIR=$TRIVY_CACHE_DIR GRYPE_DB_CACHE_DIR=$GRYPE_DB_CACHE_DIR (no hydration)" >&2
     exec "$@"

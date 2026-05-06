@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
@@ -31,11 +32,17 @@ func (g *GrypeScanner) Scan(ctx context.Context, source types.ImageSource, outpu
 	}
 	env := BuildEnv(envExtras)
 
-	_, _, err := ExecWithTimeout(ctx, cmd, grypeTimeoutMs, env)
+	stdout, stderr, err := ExecWithTimeout(ctx, cmd, grypeTimeoutMs, env)
 	durationMs := time.Since(start).Milliseconds()
 
 	if err != nil {
 		msg := err.Error()
+		if s := strings.TrimSpace(stderr); s != "" {
+			msg += "\n--- grype stderr ---\n" + s
+		}
+		if s := strings.TrimSpace(stdout); s != "" {
+			msg += "\n--- grype stdout ---\n" + s
+		}
 		fmt.Fprintf(os.Stderr, "Grype scan failed: %s\n", msg)
 		_ = WriteFallbackResult(outputPath, msg, nil)
 		return &types.ScannerResult{Scanner: "grype", Success: false, Error: msg, DurationMs: durationMs}, nil

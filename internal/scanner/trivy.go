@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
@@ -26,11 +27,17 @@ func (t *TrivyScanner) Scan(ctx context.Context, source types.ImageSource, outpu
 	}
 	env := BuildEnv(map[string]string{"TRIVY_CACHE_DIR": cacheDir})
 
-	_, _, err := ExecWithTimeout(ctx, cmd, trivyTimeoutMs, env)
+	stdout, stderr, err := ExecWithTimeout(ctx, cmd, trivyTimeoutMs, env)
 	durationMs := time.Since(start).Milliseconds()
 
 	if err != nil {
 		msg := err.Error()
+		if s := strings.TrimSpace(stderr); s != "" {
+			msg += "\n--- trivy stderr ---\n" + s
+		}
+		if s := strings.TrimSpace(stdout); s != "" {
+			msg += "\n--- trivy stdout ---\n" + s
+		}
 		fmt.Fprintf(os.Stderr, "Trivy scan failed: %s\n", msg)
 		_ = WriteFallbackResult(outputPath, msg, nil)
 		return &types.ScannerResult{Scanner: "trivy", Success: false, Error: msg, DurationMs: durationMs}, nil

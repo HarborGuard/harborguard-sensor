@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
@@ -42,11 +43,18 @@ func (o *OsvScanner) Scan(ctx context.Context, source types.ImageSource, outputP
 				"SYFT_REGISTRY_INSECURE_USE_HTTP":        "true",
 			})
 		}
-		_, _, err := ExecWithTimeout(ctx, cmd, osvTimeoutMs, sbomEnv)
+		stdout, stderr, err := ExecWithTimeout(ctx, cmd, osvTimeoutMs, sbomEnv)
 		if err != nil {
 			msg := err.Error()
 			if ctx.Err() != nil {
 				msg = "scan cancelled"
+			} else {
+				if s := strings.TrimSpace(stderr); s != "" {
+					msg += "\n--- syft (osv sbom) stderr ---\n" + s
+				}
+				if s := strings.TrimSpace(stdout); s != "" {
+					msg += "\n--- syft (osv sbom) stdout ---\n" + s
+				}
 			}
 			fmt.Fprintf(os.Stderr, "OSV scan failed: %s\n", msg)
 			_ = WriteFallbackResult(outputPath, msg, map[string]interface{}{"vulnerabilities": []interface{}{}})
@@ -57,12 +65,18 @@ func (o *OsvScanner) Scan(ctx context.Context, source types.ImageSource, outputP
 
 	// Run osv-scanner — exit code 1 means vulns found (success)
 	cmd := fmt.Sprintf(`osv-scanner -L "%s" --verbosity error --format json > "%s"`, ownSbom, outputPath)
-	_, _, err := ExecWithTimeout(ctx, cmd, osvTimeoutMs, nil)
+	stdout, stderr, err := ExecWithTimeout(ctx, cmd, osvTimeoutMs, nil)
 
 	if err != nil {
 		// Check if output file was written (exit code 1 = vulns found)
 		if _, statErr := os.Stat(outputPath); statErr != nil {
 			msg := err.Error()
+			if s := strings.TrimSpace(stderr); s != "" {
+				msg += "\n--- osv-scanner stderr ---\n" + s
+			}
+			if s := strings.TrimSpace(stdout); s != "" {
+				msg += "\n--- osv-scanner stdout ---\n" + s
+			}
 			fmt.Fprintf(os.Stderr, "OSV scan failed: %s\n", msg)
 			_ = WriteFallbackResult(outputPath, msg, map[string]interface{}{"vulnerabilities": []interface{}{}})
 			if cleanupSbom {

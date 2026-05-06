@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/HarborGuard/harborguard-sensor/internal/types"
@@ -25,11 +26,17 @@ func (d *DockleScanner) Scan(ctx context.Context, source types.ImageSource, outp
 	}
 
 	cmd := d.buildCommand(source, outputPath)
-	_, _, err := ExecWithTimeout(ctx, cmd, dockleTimeoutMs, nil)
+	stdout, stderr, err := ExecWithTimeout(ctx, cmd, dockleTimeoutMs, nil)
 	durationMs := time.Since(start).Milliseconds()
 
 	if err != nil {
 		msg := err.Error()
+		if s := strings.TrimSpace(stderr); s != "" {
+			msg += "\n--- dockle stderr ---\n" + s
+		}
+		if s := strings.TrimSpace(stdout); s != "" {
+			msg += "\n--- dockle stdout ---\n" + s
+		}
 		fmt.Fprintf(os.Stderr, "Dockle scan failed: %s\n", msg)
 		_ = WriteFallbackResult(outputPath, msg, nil)
 		return &types.ScannerResult{Scanner: "dockle", Success: false, Error: msg, DurationMs: durationMs}, nil
