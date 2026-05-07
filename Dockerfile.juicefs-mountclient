@@ -1,0 +1,130 @@
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
+ARG TARGETOS TARGETARCH
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o /harborguard-sensor .
+
+FROM alpine:3.20
+WORKDIR /app
+
+ARG TARGETARCH
+ARG TRIVY_VERSION=v0.69.3
+ARG DOCKLE_VERSION=0.4.15
+ARG OSV_SCANNER_VERSION=v2.2.2
+ARG DIVE_VERSION=0.13.1
+ARG JUICEFS_VERSION=1.3.1
+
+# Scanner binaries + skopeo for registry image prefetch.
+# fuse3 + libfuse3 provide /dev/fuse client libs — required by the JuiceFS
+# CE binary (which links against libfuse3) when sensor-init.sh mounts the
+# scanner DB tree from a remote JuiceFS metadata service. /dev/fuse is
+# exposed on Fly Firecracker (CONFIG_FUSE_FS=y on 6.12.47-fly), so the
+# mount works without --privileged or CAP_SYS_ADMIN — a clean win over
+# the NFS variant's mount(2) requirement.
+# buildah + fuse-overlayfs enable optional image patching. Whether patching
+# is actually usable at runtime is decided by capability probe (buildah on
+# PATH; storage driver auto-selects overlay when /dev/fuse is present, else vfs).
+RUN apk add --no-cache curl bash ca-certificates skopeo buildah netavark fuse-overlayfs tini fuse3 \
+  && set -eux \
+  && echo "Building for architecture: ${TARGETARCH:-not set}" \
+  && TARGETARCH="${TARGETARCH:-amd64}" \
+  # Create a fake uname that returns the correct architecture for the target platform
+  && echo '#!/bin/sh' > /usr/local/bin/uname \
+  && echo 'if [ "$1" = "-m" ]; then' >> /usr/local/bin/uname \
+  && echo '  case "${TARGETARCH}" in' >> /usr/local/bin/uname \
+  && echo '    arm64) echo "aarch64" ;;' >> /usr/local/bin/uname \
+  && echo '    amd64) echo "x86_64" ;;' >> /usr/local/bin/uname \
+  && echo '    *) echo "x86_64" ;;' >> /usr/local/bin/uname \
+  && echo '  esac' >> /usr/local/bin/uname \
+  && echo 'else' >> /usr/local/bin/uname \
+  && echo '  /bin/uname "$@"' >> /usr/local/bin/uname \
+  && echo 'fi' >> /usr/local/bin/uname \
+  && chmod +x /usr/local/bin/uname \
+  # Install Trivy
+  && curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin "${TRIVY_VERSION}" \
+  # Install Grype (will use our fake uname)
+  && curl -fsSL https://get.anchore.io/grype | sh -s -- -b /usr/local/bin \
+  # Install Syft (will use our fake uname)
+  && curl -sSfL https://get.anchore.io/syft | sh -s -- -b /usr/local/bin \
+  # Remove the fake uname after installation
+  && rm /usr/local/bin/uname \
+  # Install JuiceFS CE — pinned to a stable release for reproducibility.
+  # The official `https://d.juicefs.com/install` endpoint resolves to a
+  # rolling :latest, which is wrong for a baked image. Pull the tarball
+  # directly from GitHub releases.
+  && curl -L "https://github.com/juicedata/juicefs/releases/download/v${JUICEFS_VERSION}/juicefs-${JUICEFS_VERSION}-linux-${TARGETARCH}.tar.gz" \
+       -o /tmp/juicefs.tgz \
+  && tar -xzf /tmp/juicefs.tgz -C /tmp juicefs \
+  && mv /tmp/juicefs /usr/local/bin/juicefs \
+  && chmod +x /usr/local/bin/juicefs \
+  && rm /tmp/juicefs.tgz \
+  # Install Dockle (conditional arch)
+  && if [ "$TARGETARCH" = "amd64" ]; then \
+        DOCKLE_ARCH=64bit; \
+     elif [ "$TARGETARCH" = "arm64" ]; then \
+        DOCKLE_ARCH=ARM64; \
+     else \
+        echo "Unsupported architecture: $TARGETARCH" && exit 1; \
+     fi \
+  && echo "Downloading dockle for ${DOCKLE_ARCH}" \
+  && curl -L "https://github.com/goodwithtech/dockle/releases/download/v${DOCKLE_VERSION}/dockle_${DOCKLE_VERSION}_Linux-${DOCKLE_ARCH}.tar.gz" \
+       -o /tmp/dockle.tgz \
+  && tar -xzf /tmp/dockle.tgz -C /usr/local/bin dockle \
+  && rm /tmp/dockle.tgz \
+  && chmod +x /usr/local/bin/dockle \
+  # Install Dive (dynamic arch)
+  && curl -L "https://github.com/wagoodman/dive/releases/download/v${DIVE_VERSION}/dive_${DIVE_VERSION}_linux_${TARGETARCH}.tar.gz" \
+       -o /tmp/dive.tgz \
+  && tar -xzf /tmp/dive.tgz -C /usr/local/bin dive \
+  && rm /tmp/dive.tgz \
+  && chmod +x /usr/local/bin/dive \
+  # Install OSV Scanner (dynamic arch)
+  && curl -L "https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}/osv-scanner_linux_${TARGETARCH}" \
+       -o /usr/local/bin/osv-scanner \
+  && chmod +x /usr/local/bin/osv-scanner \
+  && rm -rf /tmp/* /var/tmp/*
+
+# Workspace (writable runtime caches; populated by sensor-init.sh from the
+# baked /opt/sensor/db layer at container start).
+RUN mkdir -p /workspace/cache/trivy/db /workspace/cache/grype /workspace/cache/syft /workspace/reports
+
+ENV TRIVY_CACHE_DIR=/workspace/cache/trivy
+ENV GRYPE_DB_CACHE_DIR=/workspace/cache/grype
+ENV SYFT_CACHE_DIR=/workspace/cache/syft
+
+# JuiceFS-PoC variant: scanner DB bake removed.
+#
+# In production this layer downloads ~4 GB of vulnerability/index DBs into
+# /opt/sensor/db. For the JuiceFS PoC, those DBs come from a remote JuiceFS
+# share at runtime: metadata in Redis (or sqlite for dev), blobs in Tigris
+# S3. Sensor-init.sh runs `juicefs mount -d` against $HG_JUICEFS_META and
+# the existing direct-read branch picks up the populated mountpoint.
+#
+# Removed in this variant:
+#   - trivy image --download-db-only        (was ~2.4 GB)
+#   - trivy image --download-java-db-only   (was ~10 MB)
+#   - grype db update                        (was ~1.5 GB)
+#
+# Cache-backend memory (set in internal/scanner/trivy.go) means Trivy no
+# longer needs an RW fanal cache, so a read-only JuiceFS mount is sufficient.
+RUN mkdir -p /opt/sensor/db/trivy /opt/sensor/db/grype
+
+# Binary (placed late so daily DB-only refreshes don't bust the binary
+# layer's cache — though our CI rebuilds top-down, this is still the
+# correct ordering for any local incremental builds).
+COPY --from=builder /harborguard-sensor /usr/local/bin/harborguard-sensor
+
+# Init script. With HG_JUICEFS_META set, mounts the JuiceFS share at
+# /opt/sensor/db then forces HG_DB_DIRECT_READ=1 so scanners read DBs
+# straight from the FUSE mount.
+COPY scripts/sensor-init.sh /usr/local/bin/sensor-init.sh
+RUN chmod +x /usr/local/bin/sensor-init.sh
+
+# tini reaps zombies (e.g. fuse-overlayfs daemons reparented to PID 1
+# when buildah exits, or the juicefs daemon if it ever forks) and
+# forwards signals to the sensor. sensor-init.sh does the DB hydration
+# / JuiceFS mount, then exec's the real binary.
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/sensor-init.sh", "harborguard-sensor"]
+CMD ["agent"]

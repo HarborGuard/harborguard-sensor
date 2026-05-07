@@ -53,7 +53,14 @@ func (t *TrivyScanner) Scan(ctx context.Context, source types.ImageSource, outpu
 }
 
 func (t *TrivyScanner) buildCommand(source types.ImageSource, outputPath string) string {
-	base := fmt.Sprintf(`trivy image -f json -o "%s"`, outputPath)
+	// --cache-backend memory bypasses fanal.db (the per-image artifact cache)
+	// entirely. Trivy's default fs backend opens <TRIVY_CACHE_DIR>/fanal/fanal.db
+	// O_RDWR|O_CREAT, which fails on read-only NFS-baked DB layouts. The
+	// vulnerability DB itself (trivy.db) is unaffected — it stays RDONLY.
+	// Verified against trivy v0.69.3: scan output is byte-identical to fs
+	// backend, only the per-image artifact cache becomes throwaway (which is
+	// fine in our ephemeral-machine-per-scan topology).
+	base := fmt.Sprintf(`trivy image --cache-backend memory -f json -o "%s"`, outputPath)
 	if source.Insecure && source.Type == "registry" {
 		base += " --insecure"
 	}
