@@ -232,6 +232,12 @@ jobs:
       # so a worker reading HG_SENSOR_IMAGE=:latest gets the rollback path.
       # Phase 5 cutover flips workers to HG_SENSOR_IMAGE_NFS, which references
       # the :nfs-prod tag (separate registry app).
+      #
+      # IMPORTANT: flavor.latest=auto (NOT =true) for the bake variant. With
+      # `=true`, metadata-action force-emits :latest on every ref including
+      # feature branches — which would silently move prod-harborguard-sensor:latest
+      # to a feature-branch build. `=auto` only emits :latest on the default
+      # branch (per docker/metadata-action README, behavior table).
       - name: Extract metadata for GHCR
         if: steps.gate.outputs.skip == 'false'
         id: meta
@@ -240,7 +246,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}
           flavor: |
             prefix=${{ matrix.variant.tag_prefix }},onlatest=false
-            latest=${{ matrix.variant.name == 'bake' }}
+            latest=${{ matrix.variant.name == 'bake' && 'auto' || 'false' }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -299,7 +305,7 @@ jobs:
           images: registry.fly.io/staging-harborguard-scans
           flavor: |
             prefix=${{ matrix.variant.tag_prefix }},onlatest=false
-            latest=${{ matrix.variant.name == 'bake' }}
+            latest=${{ matrix.variant.name == 'bake' && 'auto' || 'false' }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -367,7 +373,7 @@ jobs:
           images: ${{ matrix.variant.prod_image }}
           flavor: |
             prefix=${{ matrix.variant.tag_prefix }},onlatest=false
-            latest=${{ matrix.variant.name == 'bake' }}
+            latest=${{ matrix.variant.name == 'bake' && 'auto' || 'false' }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
