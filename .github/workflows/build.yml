@@ -1,5 +1,32 @@
 name: Build and Push Container
 
+# Two image variants are built on every push to main / on schedule:
+#
+#   variant=bake     (Dockerfile)
+#     - Canonical legacy build with scanner DBs baked into the image at build time.
+#     - Pushed to GHCR + registry.fly.io/{staging-harborguard-scans,prod-harborguard-sensor}.
+#     - Continues to back HG_SENSOR_IMAGE in workers (default-off NFS path).
+#     - Required so a Phase 5 rollback (HG_USE_NFS_DB=0) keeps scanning with
+#       fresh DBs instead of a frozen :bake-pre-juicefs snapshot that decays.
+#
+#   variant=juicefs  (Dockerfile.juicefs-mountclient)
+#     - JuiceFS mount-client variant: no DB bake, mounts a shared JuiceFS
+#       volume at runtime. Validated as Phase 3 staging-cutover image.
+#     - Pushed to GHCR + registry.fly.io/{staging-harborguard-scans,prod-harborguard-scans}
+#       under :nfs-* tag scheme so it cannot collide with the bake :latest.
+#     - Backs HG_SENSOR_IMAGE_NFS in workers; resolver in src/lib/sensor.ts
+#       prefers it when HG_USE_NFS_DB=1.
+#
+# Notes on tag scheme (intentional, do not "simplify"):
+#   bake variant:    :<branch>, :<sha8>, :latest (on main), :<semver> on tag
+#   juicefs variant: :nfs-<branch>, :nfs-<sha8>, :nfs-prod (on main, only to
+#                    prod-harborguard-scans), :nfs-staging (on main, only to
+#                    staging-harborguard-scans). NEVER :latest — that's the
+#                    bake variant's namespace and Phase 5 reserves :latest as
+#                    the rollback path.
+#   :bake-pre-juicefs is a manually-pinned rollback tag created by deploy-sme
+#                    in Phase 5 prep. CI MUST NOT touch it.
+
 on:
   schedule:
     - cron: '00 00 * * *'
@@ -8,22 +35,49 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main]
+  # Manual trigger lets us run the workflow from feature branches without
+  # polluting the registry with per-feature-branch :latest / :nfs-prod tags
+  # (those are gated by is_default_branch). The toggles let a dispatch
+  # rebuild only one variant — useful when iterating on Dockerfile.juicefs
+  # without rebuilding the bake DBs (~3 min savings).
   workflow_dispatch:
+    inputs:
+      build_juicefs:
+        description: 'Build JuiceFS variant (default true)'
+        type: boolean
+        default: true
+      build_bake:
+        description: 'Build bake variant (default true)'
+        type: boolean
+        default: true
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # Per-arch builds, one job instance per (variant, platform) cell.
+  # 4 cells in steady state: {bake,juicefs} x {amd64,arm64}.
+  # Each variant pushes its per-arch digest to GHCR; the merge job below
+  # then assembles the multi-arch index per variant and mirrors to Fly.
   build:
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: linux/amd64
+        variant:
+          - name: bake
+            dockerfile: Dockerfile
+            tag_prefix: ''
+          - name: juicefs
+            dockerfile: Dockerfile.juicefs-mountclient
+            tag_prefix: 'nfs-'
+        platform:
+          - id: linux/amd64
+            short: amd64
             runner: ubuntu-latest
-          - platform: linux/arm64
+          - id: linux/arm64
+            short: arm64
             runner: ubuntu-24.04-arm
     permissions:
       contents: read
@@ -32,14 +86,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Skip variant if disabled via workflow_dispatch
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ matrix.variant.name }}" = "bake" ] && [ "${{ inputs.build_bake }}" != "true" ]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::Skipping bake variant (workflow_dispatch input build_bake=false)"
+              exit 0
+            fi
+            if [ "${{ matrix.variant.name }}" = "juicefs" ] && [ "${{ inputs.build_juicefs }}" != "true" ]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::Skipping juicefs variant (workflow_dispatch input build_juicefs=false)"
+              exit 0
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
       - name: Lowercase image name
+        if: steps.gate.outputs.skip == 'false'
         run: echo "IMAGE_NAME_LC=${IMAGE_NAME,,}" >> $GITHUB_ENV
 
       - name: Set up Docker Buildx
+        if: steps.gate.outputs.skip == 'false'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+        if: steps.gate.outputs.skip == 'false' && github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -47,39 +120,52 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
+        if: steps.gate.outputs.skip == 'false'
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}
 
+      # Each variant builds with a distinct cache scope so a bake DB refresh
+      # doesn't bust the juicefs layer's cache and vice versa.
       - name: Build and push by digest
+        if: steps.gate.outputs.skip == 'false'
         id: build
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ matrix.variant.dockerfile }}
           push: ${{ github.event_name != 'pull_request' }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
-          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=${{ matrix.variant.name }}-${{ matrix.platform.short }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant.name }}-${{ matrix.platform.short }}
+          platforms: ${{ matrix.platform.id }}
           outputs: ${{ github.event_name != 'pull_request' && format('type=image,name={0}/{1},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY, env.IMAGE_NAME_LC) || '' }}
 
       - name: Export digest
-        if: github.event_name != 'pull_request'
+        if: steps.gate.outputs.skip == 'false' && github.event_name != 'pull_request'
         run: |
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        if: github.event_name != 'pull_request'
+        if: steps.gate.outputs.skip == 'false' && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          name: digests-${{ matrix.variant.name }}-${{ matrix.platform.short }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
+  # Per-variant merge + mirror. Two job instances in steady state.
+  # - bake variant goes to: GHCR + staging-harborguard-scans + prod-harborguard-sensor
+  # - juicefs variant goes to: GHCR + staging-harborguard-scans + prod-harborguard-scans
+  #
+  # The two variants share staging-harborguard-scans (different tag prefixes
+  # keep them disjoint), but use *different* prod registry apps because the
+  # prod rollback design separates the bake lineage (prod-harborguard-sensor)
+  # from the new JuiceFS lineage (prod-harborguard-scans).
   merge:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
@@ -87,68 +173,99 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: bake
+            tag_prefix: ''
+            prod_image: registry.fly.io/prod-harborguard-sensor
+          - name: juicefs
+            tag_prefix: 'nfs-'
+            prod_image: registry.fly.io/prod-harborguard-scans
 
     steps:
+      - name: Skip variant if disabled via workflow_dispatch
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ matrix.variant.name }}" = "bake" ] && [ "${{ inputs.build_bake }}" != "true" ]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "${{ matrix.variant.name }}" = "juicefs" ] && [ "${{ inputs.build_juicefs }}" != "true" ]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
       - name: Lowercase image name
+        if: steps.gate.outputs.skip == 'false'
         run: echo "IMAGE_NAME_LC=${IMAGE_NAME,,}" >> $GITHUB_ENV
 
-      - name: Download digests
+      - name: Download digests for this variant
+        if: steps.gate.outputs.skip == 'false'
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digests-*
+          pattern: digests-${{ matrix.variant.name }}-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
+        if: steps.gate.outputs.skip == 'false'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
+        if: steps.gate.outputs.skip == 'false'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
+      # Tag scheme (per variant):
+      #   bake:    :<branch>, :<sha8>, :<semver>, :latest (default branch)
+      #   juicefs: :nfs-<branch>, :nfs-<sha8>, :nfs-<semver>, :nfs-staging
+      #            and :nfs-prod (default branch only).
+      # Crucially, juicefs DOES NOT push :latest. The bake variant owns :latest
+      # so a worker reading HG_SENSOR_IMAGE=:latest gets the rollback path.
+      # Phase 5 cutover flips workers to HG_SENSOR_IMAGE_NFS, which references
+      # the :nfs-prod tag (separate registry app).
+      - name: Extract metadata for GHCR
+        if: steps.gate.outputs.skip == 'false'
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}
+          flavor: |
+            prefix=${{ matrix.variant.tag_prefix }},onlatest=false
+            latest=${{ matrix.variant.name == 'bake' }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=${{ matrix.variant.tag_prefix }}
 
-      - name: Create manifest list and push
+      - name: Create GHCR manifest list and push
+        if: steps.gate.outputs.skip == 'false'
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}@sha256:%s ' *)
 
-      - name: Inspect image
+      - name: Inspect GHCR image
+        if: steps.gate.outputs.skip == 'false'
         run: |
           docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ steps.meta.outputs.version }}
 
-      # Mirror the same multi-arch image to registry.fly.io so Fly
-      # Machines launched by the dispatcher pull from inside Fly's
-      # network instead of the public internet (~30s → ~5–10s cold
-      # start, no GHCR rate-limit risk). buildx imagetools create
-      # does a cross-registry copy from the GHCR per-arch digests
-      # already present in /tmp/digests.
-      #
-      # The legacy `registry.fly.io/harborguard-sensor` push leg has been
-      # removed: the namespace-holder app appears to have been destroyed,
-      # and CI was failing on every run trying to push there. Each Fly
-      # org now has its own per-org mirror (staging-harborguard-scans,
-      # prod-harborguard-sensor) with org-scoped tokens.
-
       # Mirror to the staging Fly org (org `harborguard-882`,
-      # registry.fly.io/staging-harborguard-scans). This is what the
-      # staging Machines pull from after the org migration. Token is
-      # org-scoped — needs a separate FLY_REGISTRY_TOKEN_STAGING secret.
+      # registry.fly.io/staging-harborguard-scans). Both variants land here
+      # but with disjoint tag prefixes (bake uses :main / :latest, juicefs
+      # uses :nfs-main / :nfs-staging). Token is org-scoped — needs
+      # FLY_REGISTRY_TOKEN_STAGING secret.
       - name: Check for staging Fly token
+        if: steps.gate.outputs.skip == 'false'
         id: staging-token-check
         env:
           FLY_REGISTRY_TOKEN_STAGING: ${{ secrets.FLY_REGISTRY_TOKEN_STAGING }}
@@ -157,32 +274,41 @@ jobs:
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::FLY_REGISTRY_TOKEN_STAGING not set, skipping staging-harborguard-scans mirror"
+            echo "::notice::FLY_REGISTRY_TOKEN_STAGING not set, skipping staging-harborguard-scans mirror for ${{ matrix.variant.name }}"
           fi
 
       - name: Log in to Fly registry (staging org)
-        if: steps.staging-token-check.outputs.present == 'true'
+        if: steps.gate.outputs.skip == 'false' && steps.staging-token-check.outputs.present == 'true'
         uses: docker/login-action@v3
         with:
           registry: registry.fly.io
           username: x
           password: ${{ secrets.FLY_REGISTRY_TOKEN_STAGING }}
 
+      # For juicefs variant, the rolling tag on default branch is :nfs-staging
+      # (matches the manual tag deploy-sme created in Phase 3 and what staging
+      # workers consume via HG_SENSOR_IMAGE_NFS). For bake variant, the
+      # default-branch rolling tag is :latest (via flavor.latest=true) and the
+      # raw `:staging` rule is disabled (would otherwise emit `:staging`,
+      # which workers don't consume and would just clutter the registry).
       - name: Extract metadata for Fly staging image
-        if: steps.staging-token-check.outputs.present == 'true'
+        if: steps.gate.outputs.skip == 'false' && steps.staging-token-check.outputs.present == 'true'
         id: fly-staging-meta
         uses: docker/metadata-action@v5
         with:
           images: registry.fly.io/staging-harborguard-scans
+          flavor: |
+            prefix=${{ matrix.variant.tag_prefix }},onlatest=false
+            latest=${{ matrix.variant.name == 'bake' }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=${{ matrix.variant.tag_prefix }}
+            type=raw,value=staging,prefix=${{ matrix.variant.tag_prefix }},enable=${{ matrix.variant.name == 'juicefs' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
       - name: Push manifest list to Fly registry (staging)
-        if: steps.staging-token-check.outputs.present == 'true'
+        if: steps.gate.outputs.skip == 'false' && steps.staging-token-check.outputs.present == 'true'
         working-directory: /tmp/digests
         env:
           DOCKER_METADATA_OUTPUT_JSON: ${{ steps.fly-staging-meta.outputs.json }}
@@ -191,19 +317,23 @@ jobs:
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}@sha256:%s ' *)
 
       - name: Inspect Fly staging image
-        if: steps.staging-token-check.outputs.present == 'true'
+        if: steps.gate.outputs.skip == 'false' && steps.staging-token-check.outputs.present == 'true'
         run: |
           docker buildx imagetools inspect registry.fly.io/staging-harborguard-scans:${{ steps.fly-staging-meta.outputs.version }}
 
-      # Mirror to the prod-harborguard Fly org's registry app
-      # (registry.fly.io/prod-harborguard-sensor). Fly registry tokens are
-      # org-scoped, so we need a second token. If the secret is unset (e.g.
-      # OSS forks without prod creds), all prod-mirror steps are skipped.
+      # Mirror to the prod-harborguard Fly org. Each variant uses its OWN
+      # prod registry app:
+      #   bake    -> registry.fly.io/prod-harborguard-sensor
+      #   juicefs -> registry.fly.io/prod-harborguard-scans
       #
-      # buildx imagetools create is idempotent: if the destination tag
-      # already points at the same digest, the registry returns a no-op
-      # rather than re-uploading layers.
+      # CRITICAL: this workflow MUST NOT touch :bake-pre-juicefs. That tag is
+      # a manually-pinned digest snapshot deploy-sme created from a specific
+      # known-good prod image (sha256:dd9fcefc07fb…) for emergency rollback.
+      # Re-tagging it from CI on every push would defeat the purpose of a
+      # frozen rollback target. Filter explicitly excludes that tag and any
+      # nfs-prod- per-sha if a maintainer ever creates one.
       - name: Check for prod Fly token
+        if: steps.gate.outputs.skip == 'false'
         id: prod-token-check
         env:
           FLY_REGISTRY_TOKEN_PROD: ${{ secrets.FLY_REGISTRY_TOKEN_PROD }}
@@ -212,32 +342,41 @@ jobs:
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::FLY_REGISTRY_TOKEN_PROD not set, skipping prod-harborguard-sensor mirror"
+            echo "::notice::FLY_REGISTRY_TOKEN_PROD not set, skipping prod mirror for ${{ matrix.variant.name }}"
           fi
 
       - name: Log in to Fly registry (prod org)
-        if: steps.prod-token-check.outputs.present == 'true'
+        if: steps.gate.outputs.skip == 'false' && steps.prod-token-check.outputs.present == 'true'
         uses: docker/login-action@v3
         with:
           registry: registry.fly.io
           username: x
           password: ${{ secrets.FLY_REGISTRY_TOKEN_PROD }}
 
+      # The :nfs-prod tag (juicefs variant only, default branch only) matches
+      # what HG_SENSOR_IMAGE_NFS in prod-harborguard-workers references. Bake
+      # gets :latest on default branch via flavor.latest=true; juicefs is
+      # opted out of :latest so the workers' rollback path
+      # (HG_SENSOR_IMAGE=:latest in prod-harborguard-sensor) only ever
+      # resolves to bake builds.
       - name: Extract metadata for Fly prod image
-        if: steps.prod-token-check.outputs.present == 'true'
+        if: steps.gate.outputs.skip == 'false' && steps.prod-token-check.outputs.present == 'true'
         id: fly-prod-meta
         uses: docker/metadata-action@v5
         with:
-          images: registry.fly.io/prod-harborguard-sensor
+          images: ${{ matrix.variant.prod_image }}
+          flavor: |
+            prefix=${{ matrix.variant.tag_prefix }},onlatest=false
+            latest=${{ matrix.variant.name == 'bake' }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=${{ matrix.variant.tag_prefix }}
+            type=raw,value=prod,prefix=${{ matrix.variant.tag_prefix }},enable=${{ matrix.variant.name == 'juicefs' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
       - name: Push manifest list to Fly registry (prod org)
-        if: steps.prod-token-check.outputs.present == 'true'
+        if: steps.gate.outputs.skip == 'false' && steps.prod-token-check.outputs.present == 'true'
         working-directory: /tmp/digests
         env:
           DOCKER_METADATA_OUTPUT_JSON: ${{ steps.fly-prod-meta.outputs.json }}
@@ -246,6 +385,6 @@ jobs:
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}@sha256:%s ' *)
 
       - name: Inspect Fly prod image
-        if: steps.prod-token-check.outputs.present == 'true'
+        if: steps.gate.outputs.skip == 'false' && steps.prod-token-check.outputs.present == 'true'
         run: |
-          docker buildx imagetools inspect registry.fly.io/prod-harborguard-sensor:${{ steps.fly-prod-meta.outputs.version }}
+          docker buildx imagetools inspect ${{ matrix.variant.prod_image }}:${{ steps.fly-prod-meta.outputs.version }}
